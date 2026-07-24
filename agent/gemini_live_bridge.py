@@ -27,11 +27,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+from datetime import datetime, timezone
 import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +52,207 @@ GEMINI_WS_URL_TEMPLATE = (
 _FALLBACK_PERSONA = (
     "Sos Alfred, el mayordomo digital del Dr. Rodrigo Hamuy. Hablas en espanol "
     "neutro latinoamericano, SIN voseo (usa siempre tu). Tu voz es femenina y "
-    "calida. Respuestas breves y conversacionales, como si hablaras en vivo."
+    "calida. Respuestas breves y conversacionales, como si hablaras en vivo. "
+    "Tenes acceso limitado a memoria, agenda y recordatorios; usa esas herramientas "
+    "solo ante pedidos explícitos de Rodrigo."
 )
+
+_ALFRED_HOME = Path(os.environ.get("ALFRED_HOME", str(Path.home() / "alfred")))
+_GBRAIN_BIN = os.environ.get("SPINE_GBRAIN_BIN", str(Path.home() / ".bun" / "bin" / "gbrain"))
+_CALENDAR_PULSE = _ALFRED_HOME / "scripts" / "calendar-pulse.cjs"
+_REMINDERS_MODULE = _ALFRED_HOME / "telegram-bot" / "dist" / "reminders.js"
+_SENSITIVE_DATA_GATE = _ALFRED_HOME / "security" / "sensitive-data.cjs"
+_MEMORY_PERSISTENCE_GATE = _ALFRED_HOME / "security" / "memory-persistence-gate.cjs"
+
+# Las especificaciones se conservan con la forma OpenAI que ya usa Hermes y se
+# sanitizan justo antes de enviarlas. Así no nace otro dialecto de schemas para
+# Live distinto del adaptador Gemini nativo.
+_LIVE_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "buscar_memoria",
+        "description": "Busca en la memoria permanente de Rodrigo (gbrain).",
+        "parameters": {
+            "type": "object",
+            "properties": {"consulta": {"type": "string", "description": "Término de búsqueda."}},
+            "required": ["consulta"],
+        },
+    },
+    {
+        "name": "guardar_en_memoria",
+        "description": "Guarda un hecho o decisión no sensible en la memoria permanente. Nunca uses para PHI ni secretos.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hecho": {"type": "string", "description": "Hecho o decisión, máximo 500 caracteres; sin PHI."},
+                "categoria": {"type": "string", "description": "personal, proyectos, decisiones, preferencias, recordatorio u otro."},
+            },
+            "required": ["hecho"],
+        },
+    },
+    {
+        "name": "agenda_hoy",
+        "description": "Consulta la agenda de Google Calendar de Rodrigo para las próximas 48 horas.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crear_recordatorio",
+        "description": "Crea un recordatorio que Alfred enviará por Telegram a la hora indicada. Úsala solamente ante un pedido explícito de Rodrigo.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "texto": {"type": "string", "description": "Texto del recordatorio."},
+                "cuando_iso": {"type": "string", "description": "Fecha y hora ISO 8601 en zona Asunción (UTC-3)."},
+            },
+            "required": ["texto", "cuando_iso"],
+        },
+    },
+]
+
+
+async def _run_local_command(*args: str, input_text: str = "", timeout: float) -> tuple[int, str]:
+    """Ejecuta un backend local compartido sin exponer stderr al modelo."""
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(input_text.encode("utf-8")), timeout)
+        return process.returncode or 0, stdout.decode("utf-8", errors="replace")
+    except (OSError, asyncio.TimeoutError):
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+                await process.wait()
+        return 1, ""
+
+
+async def _run_node_json(script: str, payload: dict[str, Any], *, timeout: float = 15.0) -> Optional[dict[str, Any]]:
+    code, stdout = await _run_local_command("node", "-e", script, input_text=json.dumps(payload), timeout=timeout)
+    if code != 0 or not stdout:
+        return None
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+async def _guard_live_tool(name: str, args: dict[str, Any]) -> str:
+    """Reusa literalmente los gates de secretos/PHI del Telegram brain."""
+    script = f"""
+const {{ containsSecret }} = require({json.dumps(str(_SENSITIVE_DATA_GATE))});
+const {{ inspectMemoryPersistence }} = require({json.dumps(str(_MEMORY_PERSISTENCE_GATE))});
+let payload;
+try {{ payload = JSON.parse(require('fs').readFileSync(0, 'utf8')); }} catch {{ process.stdout.write(JSON.stringify({{reason:'unserializable'}})); process.exit(0); }}
+try {{
+  const serialized = JSON.stringify({{name: payload.name, input: payload.args}});
+  if (typeof serialized !== 'string') throw new Error('unserializable');
+  if (containsSecret(serialized)) {{ process.stdout.write(JSON.stringify({{reason:'secret'}})); process.exit(0); }}
+  if (payload.name === 'guardar_en_memoria') {{
+    const persistence = inspectMemoryPersistence(serialized, {{secretPolicy:'block'}});
+    if (!persistence.allowed && persistence.action === 'block_phi') {{ process.stdout.write(JSON.stringify({{reason:'phi'}})); process.exit(0); }}
+  }}
+  process.stdout.write(JSON.stringify({{reason:'allow'}}));
+}} catch {{ process.stdout.write(JSON.stringify({{reason:'unserializable'}})); }}
+"""
+    result = await _run_node_json(script, {"name": name, "args": args})
+    return str((result or {}).get("reason") or "unserializable")
+
+
+async def _sanitize_live_tool_result(result: str) -> str:
+    """Mismo redactor final que Telegram, aun si falló un backend local."""
+    script = f"""
+const {{ redactSensitiveText }} = require({json.dumps(str(_SENSITIVE_DATA_GATE))});
+let payload = {{}}; try {{ payload = JSON.parse(require('fs').readFileSync(0, 'utf8')); }} catch {{}}
+process.stdout.write(JSON.stringify({{text: redactSensitiveText(String(payload.result ?? '')).text}}));
+"""
+    sanitized = await _run_node_json(script, {"result": result})
+    return str((sanitized or {}).get("text") or "(la herramienta no devolvió un resultado)")
+
+
+async def _execute_live_tool(name: str, args: Any) -> str:
+    """Adaptador mínimo a los backends reales ya usados por Telegram."""
+    if not isinstance(args, dict):
+        return "(argumentos inválidos para la herramienta)"
+
+    guard = await _guard_live_tool(name, args)
+    if guard == "secret":
+        return "(herramienta bloqueada: detecté una credencial; no se ejecutó)"
+    if guard == "phi":
+        return "(herramienta bloqueada: detecté datos identificables de paciente; no se enviaron ni guardaron)"
+    if guard != "allow":
+        return "(herramienta bloqueada: argumentos no seguros)"
+
+    result: str
+    if name == "buscar_memoria":
+        code, stdout = await _run_local_command(
+            _GBRAIN_BIN, "search", str(args.get("consulta", "")), "--limit", "6", "--mode", "conservative", timeout=15.0
+        )
+        if code != 0 or not stdout:
+            result = "(la memoria no respondió)"
+        else:
+            blocks: list[list[str]] = []
+            for line in stdout.splitlines():
+                if re.match(r"^\[\d\.\d+\]", line):
+                    blocks.append([line])
+                elif blocks and line.strip():
+                    blocks[-1].append(line)
+            keep = [block for block in blocks if not re.search(r"\]\s*(skills|daily)/", block[0])][:5]
+            result = "\n\n".join("\n".join(block) for block in keep)[:1800] if keep else "(sin resultados en la memoria)"
+    elif name == "guardar_en_memoria":
+        hecho = str(args.get("hecho", ""))[:500].strip()
+        if not hecho:
+            result = "(el hecho no puede estar vacío)"
+        else:
+            category = re.sub(r"[^a-z]", "", str(args.get("categoria", "personal"))) or "personal"
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%Hh%M")
+            title = hecho[:80].replace('"', '\\"')
+            content = f'---\ntitle: "{title}"\ntags: [{category}, telegram]\n---\n\n{hecho}'
+            # `gbrain put <slug>` toma el contenido por STDIN, no por un flag
+            # `--content` (verificado corriendo el CLI real: con `--content` como
+            # argumento posicional el comando sale con exit 0 pero no crea nada
+            # -- fallo silencioso. El contenido va como input_text.
+            code, _stdout = await _run_local_command(
+                _GBRAIN_BIN, "put", f"facts/{category}/{timestamp}", input_text=content, timeout=15.0
+            )
+            result = "Guardado en memoria ✓" if code == 0 else "(no pude guardar en la memoria)"
+    elif name == "agenda_hoy":
+        code, stdout = await _run_local_command("node", str(_CALENDAR_PULSE), timeout=30.0)
+        try:
+            events = json.loads(stdout).get("eventos") if code == 0 else None
+        except (json.JSONDecodeError, AttributeError):
+            events = None
+        if not isinstance(events, list):
+            result = "Sin cuentas de calendario configuradas todavía (falta la autorización de Rodrigo)."
+        elif not events:
+            result = "Agenda libre: sin eventos en las próximas 48 horas."
+        else:
+            result = "\n".join(
+                f"{event.get('inicio', '?')} → {event.get('fin', '?')} · {event.get('titulo', '(sin título)')}"
+                f"{f' [{event.get("calendario") or event.get("cuenta")}]' if event.get('calendario') or event.get('cuenta') else ''}"
+                for event in events if isinstance(event, dict)
+            )[:1800]
+    elif name == "crear_recordatorio":
+        script = f"""
+const {{ queueReminder, formatReminderDue, REMINDERS_PATH }} = require({json.dumps(str(_REMINDERS_MODULE))});
+let payload = {{}}; try {{ payload = JSON.parse(require('fs').readFileSync(0, 'utf8')); }} catch {{}}
+const texto = String(payload.texto ?? '').trim();
+const iso = String(payload.cuando_iso ?? '');
+const dated = /(?:Z|[+-]\\d{{2}}:?\\d{{2}})$/i.test(iso) ? iso : `${{iso}}-03:00`;
+const dueMs = new Date(dated).getTime();
+if (!texto || texto.length > 2000) {{ process.stdout.write(JSON.stringify({{text:'(el texto del recordatorio está vacío o es demasiado largo)'}})); }}
+else if (Number.isNaN(dueMs) || dueMs <= Date.now()) {{ process.stdout.write(JSON.stringify({{text:'(fecha/hora inválida o ya pasada — indicá un momento futuro)'}})); }}
+else {{ try {{ queueReminder({{text: texto, dueMs}}, Date.now(), REMINDERS_PATH); process.stdout.write(JSON.stringify({{text:`Recordatorio creado ✓ — te aviso el ${{formatReminderDue(dueMs)}} (Asunción)`}})); }} catch {{ process.stdout.write(JSON.stringify({{text:'(no pude crear el recordatorio)'}})); }} }}
+"""
+        reminder = await _run_node_json(script, {"texto": args.get("texto"), "cuando_iso": args.get("cuando_iso")})
+        result = str((reminder or {}).get("text") or "(no pude crear el recordatorio)")
+    else:
+        result = "(herramienta desconocida)"
+
+    return await _sanitize_live_tool_result(result)
 
 
 def _load_persona_instruction() -> str:
@@ -62,10 +265,9 @@ def _load_persona_instruction() -> str:
                 text
                 + "\n\nNOTA DE MODO DE VOZ EN VIVO: estas hablando por un canal de "
                 "voz-a-voz nativo (Gemini Live), no por el pipeline de texto habitual. "
-                "Hoy NO tenes acceso a tus herramientas (gbrain, research, tools) en este "
-                "modo especifico -- si Rodrigo pide algo que las necesita, decilo con "
-                "honestidad en una frase y sugeri seguir por Telegram o el chat de texto "
-                "del Desktop para esa tarea puntual."
+                "En este modo tenes acceso limitado a buscar y guardar memoria, consultar "
+                "la agenda y crear recordatorios. Guarda memoria o crea un recordatorio "
+                "solo ante un pedido explícito de Rodrigo. No afirmes tener otras herramientas."
             )
     except OSError:
         pass
@@ -85,6 +287,44 @@ class GeminiLiveSession:
         self._api_key = api_key
         self._persona = _load_persona_instruction()
         self._resumption_handle: Optional[str] = None
+
+    @staticmethod
+    def _live_tool_declarations() -> list[dict[str, Any]]:
+        """Convierte las cuatro schemas Hermes al subset aceptado por Gemini."""
+        declarations: list[dict[str, Any]] = []
+        for tool in _LIVE_TOOLS:
+            declarations.append(
+                {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": sanitize_gemini_tool_parameters(tool["parameters"]),
+                }
+            )
+        return declarations
+
+    async def _reply_to_tool_call(self, upstream, tool_call: Any) -> None:
+        """Ejecuta el lote pedido por Live y lo devuelve al mismo WebSocket upstream."""
+        calls = tool_call.get("functionCalls") if isinstance(tool_call, dict) else None
+        if not isinstance(calls, list):
+            return
+
+        responses: list[dict[str, Any]] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name")
+            call_id = call.get("id")
+            if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+                continue
+            result = await _execute_live_tool(name, call.get("args", {}))
+            # Live correlaciona cada respuesta con su llamada por id. No se
+            # reenvía este mensaje al Desktop: es el round-trip interno Gemini
+            # <-> bridge documentado para BidiGenerateContent:
+            # https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket
+            responses.append({"id": call_id, "name": name, "response": {"result": result}})
+
+        if responses:
+            await upstream.send(json.dumps({"toolResponse": {"functionResponses": responses}}))
 
     async def run(self, client_ws) -> None:
         """`client_ws` es el WebSocket del Desktop (servidor FastAPI)."""
@@ -136,6 +376,7 @@ class GeminiLiveSession:
                         },
                     },
                     "systemInstruction": {"parts": [{"text": self._persona}]},
+                    "tools": [{"functionDeclarations": self._live_tool_declarations()}],
                     # Habilita que Gemini nos mande sessionResumptionUpdate en
                     # cada turno; guardamos el handle más reciente para poder
                     # retomar la MISMA sesión lógica en la próxima reconexión
@@ -160,15 +401,21 @@ class GeminiLiveSession:
                         # Nada de logging por-mensaje acá: con audio a este ritmo un
                         # print(flush=True) por chunk introduce cortes audibles reales.
                         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-                        await client_ws.send_text(text)
                         try:
                             parsed = json.loads(text)
                         except (json.JSONDecodeError, UnicodeDecodeError):
+                            await client_ws.send_text(text)
                             continue
 
                         handle = parsed.get("sessionResumptionUpdate", {}).get("newHandle")
                         if handle:
                             self._resumption_handle = handle
+
+                        if "toolCall" in parsed:
+                            await self._reply_to_tool_call(upstream, parsed["toolCall"])
+                            continue
+
+                        await client_ws.send_text(text)
 
                         if "goAway" in parsed:
                             goaway = True
