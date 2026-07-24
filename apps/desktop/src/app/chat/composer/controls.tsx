@@ -3,7 +3,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX } from '@/lib/icons'
+import { AudioLines, iconSize, Layers3, Loader2, Square, SteeringWheel, Volume2, VolumeX, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import type { ConversationStatus } from './hooks/use-voice-conversation'
@@ -44,12 +44,14 @@ export function ComposerControls({
   compactModelPill = false,
   conversation,
   disabled,
+  geminiLiveActive = false,
   hasComposerPayload,
   state,
   voiceStatus,
   onDictate,
   onQueue,
-  onToggleAutoSpeak
+  onToggleAutoSpeak,
+  onToggleGeminiLive
 }: {
   autoSpeak: boolean
   busy: boolean
@@ -58,12 +60,15 @@ export function ComposerControls({
   compactModelPill?: boolean
   conversation: ConversationProps
   disabled: boolean
+  /** FX-142: segundo modo de voz, en paralelo al de conversation — Gemini Live. */
+  geminiLiveActive?: boolean
   hasComposerPayload: boolean
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
   onQueue: () => void
   onToggleAutoSpeak: () => void
+  onToggleGeminiLive?: () => void
 }) {
   const { t } = useI18n()
   const c = t.composer
@@ -80,6 +85,24 @@ export function ComposerControls({
       <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
       <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
       <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
+      {onToggleGeminiLive ? (
+        <Tip label={geminiLiveActive ? c.endGeminiLive : c.startGeminiLive}>
+          <Button
+            aria-label={geminiLiveActive ? c.endGeminiLive : c.startGeminiLive}
+            className={cn(GHOST_ICON_BTN, geminiLiveActive && 'text-(--ui-accent) bg-(--chrome-action-hover)')}
+            disabled={disabled}
+            onClick={() => {
+              triggerHaptic('open')
+              onToggleGeminiLive()
+            }}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            <Zap className={iconSize.sm} />
+          </Button>
+        </Tip>
+      ) : null}
       {busyAction === 'steer' ? (
         <Tip label={<TipKeybindLabel actionId="composer.queue" text={c.queueMessage} />}>
           <Button

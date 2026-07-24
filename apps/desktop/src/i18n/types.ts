@@ -1496,6 +1496,8 @@ export interface Translations {
     newSessionPlaceholders: readonly string[]
     followUpPlaceholders: readonly string[]
     startVoice: string
+    startGeminiLive: string
+    endGeminiLive: string
     queueMessage: string
     steer: string
     stop: string

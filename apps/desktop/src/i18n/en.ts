@@ -1800,6 +1800,8 @@ export const en: Translations = {
       'Adjust or continue'
     ],
     startVoice: 'Start voice conversation',
+    startGeminiLive: 'Start live voice (Gemini)',
+    endGeminiLive: 'End live voice',
     queueMessage: 'Queue message',
     steer: 'Steer the current run',
     stop: 'Stop',

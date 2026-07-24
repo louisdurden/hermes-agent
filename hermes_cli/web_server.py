@@ -4424,16 +4424,20 @@ async def speak_text(payload: TTSSpeakRequest):
     Used by the desktop voice-conversation mode to play back assistant
     responses without exposing the on-disk file path. Reuses the
     existing TTS provider chain (Edge / OpenAI / ElevenLabs / etc.)
-    configured in ``~/.hermes/config.yaml`` under ``tts.``.
+    configured in ``~/.hermes/config.yaml`` under ``tts.``. Only the desktop
+    calls this endpoint (Telegram/messaging replies go through the
+    ``text_to_speech`` agent tool directly, never HTTP) — so ``tts.desktop_override``
+    (FX-138, 2026-07-23) applies only here, never to platform voice replies.
     """
     text = (payload.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
 
     try:
-        from tools.tts_tool import text_to_speech_tool
+        from tools.tts_tool import _load_tts_config, text_to_speech_tool
+        override = (_load_tts_config() or {}).get("desktop_override") or None
         loop = asyncio.get_running_loop()
-        result_json = await loop.run_in_executor(None, text_to_speech_tool, text)
+        result_json = await loop.run_in_executor(None, text_to_speech_tool, text, None, override)
     except Exception as exc:
         _log.exception("Desktop voice TTS failed")
         raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
@@ -4537,6 +4541,13 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
 
         cfg = _load_tts_config()
+        # Desktop-only override (FX-138, 2026-07-23): this WS is exclusively the
+        # desktop's live-speech path (Telegram/platform replies never hit HTTP
+        # TTS endpoints), so tts.desktop_override applies unconditionally here
+        # without touching the shared tts.* config platform replies still read.
+        override = cfg.get("desktop_override") or None
+        if override:
+            cfg = {**cfg, **override}
         streamer = resolve_streaming_provider(cfg)
         cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
         return streamer, cap
@@ -4645,6 +4656,50 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         stop.set()
         text_q.put(None)
         pump.cancel()
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+
+@app.websocket("/api/voice/gemini-live")
+async def gemini_live_ws(ws: "WebSocket") -> None:
+    """Puente hacia Gemini Live — segundo cerebro de Alfred, solo voz en vivo (FX-142).
+
+    El Desktop nunca ve la API key de Google: se conecta acá, y este endpoint
+    reenvía cada frame hacia/desde `wss://generativelanguage...` real,
+    reconectando de forma transparente cuando la sesión de Gemini vence por
+    duración. Persona real (SOUL.md) + voz Autonoe, inyectadas server-side.
+
+    Alcance de esta primera integración: conversación pura, SIN acceso a las
+    tools/gbrain de Alfred todavía (ver agent/gemini_live_bridge.py).
+    """
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    api_key = (load_env().get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    await ws.accept()
+    print(f"[gemini_live] WS aceptado, api_key_len={len(api_key)}", flush=True)
+    if not api_key:
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "bridge_error", "error": "GEMINI_API_KEY no configurada"})
+            await ws.close(code=4404)
+        return
+
+    from agent.gemini_live_bridge import GeminiLiveSession
+
+    session = GeminiLiveSession(api_key)
+    try:
+        await session.run(ws)
+    except WebSocketDisconnect:
+        print("[gemini_live] cliente desconectó el WS del Desktop", flush=True)
+    except Exception as exc:  # noqa: BLE001 - diagnóstico temporal FX-142
+        print(f"[gemini_live] session.run() lanzó excepción no manejada: {exc!r}", flush=True)
+        raise
+    finally:
+        print("[gemini_live] cerrando WS del Desktop", flush=True)
         with contextlib.suppress(Exception):
             await ws.close()
 

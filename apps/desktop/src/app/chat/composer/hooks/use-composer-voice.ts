@@ -13,6 +13,7 @@ import { onComposerVoiceToggleRequest } from '../focus'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
+import { useGeminiLiveConversation } from './use-gemini-live-conversation'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
@@ -149,6 +150,20 @@ export function useComposerVoice({
     void conversation.end()
   }, [conversation])
 
+  // Segundo modo de voz, en paralelo al de arriba — Gemini Live (FX-142).
+  // Completamente independiente del estado de `conversation`: cero riesgo de
+  // interferir con el modo cascada existente si este todavía no se usa.
+  const geminiLive = useGeminiLiveConversation()
+  const toggleGeminiLive = useCallback(() => {
+    if (disabled) return
+
+    if (geminiLive.status === 'idle' || geminiLive.status === 'error') {
+      void geminiLive.start()
+    } else {
+      geminiLive.end()
+    }
+  }, [disabled, geminiLive])
+
   const handleToggleAutoSpeak = useCallback(() => {
     void setAutoSpeakReplies(!$autoSpeakReplies.get()).catch(error =>
       notifyError(error, t.settings.config.autosaveFailed)
@@ -167,8 +182,10 @@ export function useComposerVoice({
     conversation,
     dictate,
     endConversation,
+    geminiLiveActive: geminiLive.status !== 'idle',
     handleToggleAutoSpeak,
     startConversation,
+    toggleGeminiLive,
     voiceActivityState,
     voiceConversationActive,
     voiceStatus

@@ -703,8 +703,10 @@ export function ChatBar({
     conversation,
     dictate,
     endConversation,
+    geminiLiveActive,
     handleToggleAutoSpeak,
     startConversation,
+    toggleGeminiLive,
     voiceActivityState,
     voiceConversationActive,
     voiceStatus
@@ -751,10 +753,12 @@ export function ChatBar({
         status: conversation.status
       }}
       disabled={disabled}
+      geminiLiveActive={geminiLiveActive}
       hasComposerPayload={hasComposerPayload}
       onDictate={dictate}
       onQueue={queueDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}
+      onToggleGeminiLive={toggleGeminiLive}
       state={state}
       voiceStatus={voiceStatus}
     />

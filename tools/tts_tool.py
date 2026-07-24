@@ -2284,6 +2284,7 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
+    tts_config_override: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2298,6 +2299,12 @@ def text_to_speech_tool(
     Args:
         text: The text to convert to speech.
         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        tts_config_override: Optional shallow overrides merged on top of the
+            loaded ``tts:`` config (e.g. ``{"provider": "elevenlabs"}``) — used
+            by the desktop-only speak endpoints (`tts.desktop_override` in
+            config.yaml) so the desktop app can use a different voice than
+            messaging platforms without touching the shared global config.
+            ``None`` (every non-desktop caller) preserves prior behavior exactly.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -2306,6 +2313,8 @@ def text_to_speech_tool(
         return tool_error("Text is required", success=False)
 
     tts_config = _load_tts_config()
+    if tts_config_override:
+        tts_config = {**tts_config, **tts_config_override}
     provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)

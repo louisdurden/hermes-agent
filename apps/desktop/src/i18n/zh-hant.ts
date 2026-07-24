@@ -1679,6 +1679,8 @@ export const zhHant = defineLocale({
       '調整或繼續'
     ],
     startVoice: '開始語音對話',
+    startGeminiLive: '開始即時語音（Gemini）',
+    endGeminiLive: '結束即時語音',
     queueMessage: '排隊訊息',
     stop: '停止',
     send: '傳送',

@@ -165,9 +165,13 @@ export function useVoiceConversation({
 
     try {
       // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
+      // silenceMs lowered from 1_250 (FX-136, 2026-07-23): Rodrigo reported unacceptable
+      // start-of-turn lag in real use; 1.25s of required silence before the turn even
+      // begins transcribing was a direct, measurable contributor. 700ms still clears a
+      // natural mid-sentence breath pause at this silenceLevel threshold.
       await handle.start({
         silenceLevel: 0.075,
-        silenceMs: 1_250,
+        silenceMs: 700,
         idleSilenceMs: 12_000,
         onError: error => {
           notifyError(error, voiceCopy.microphoneFailed)
