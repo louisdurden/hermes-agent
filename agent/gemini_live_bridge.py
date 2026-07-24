@@ -35,6 +35,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.curated_memory import search_curated_memory
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,9 @@ _FALLBACK_PERSONA = (
 
 _ALFRED_HOME = Path(os.environ.get("ALFRED_HOME", str(Path.home() / "alfred")))
 _GBRAIN_BIN = os.environ.get("SPINE_GBRAIN_BIN", str(Path.home() / ".bun" / "bin" / "gbrain"))
+_CURATED_MEMORY_BUNDLE = Path(
+    os.environ.get("ALFRED_CLOUD_MEMORY_BUNDLE", "/app/.hermes/cloud-memory/curated_gbrain.json")
+)
 _CALENDAR_PULSE = _ALFRED_HOME / "scripts" / "calendar-pulse.cjs"
 _REMINDERS_MODULE = _ALFRED_HOME / "telegram-bot" / "dist" / "reminders.js"
 _SENSITIVE_DATA_GATE = _ALFRED_HOME / "security" / "sensitive-data.cjs"
@@ -188,20 +192,27 @@ async def _execute_live_tool(name: str, args: Any) -> str:
 
     result: str
     if name == "buscar_memoria":
-        code, stdout = await _run_local_command(
-            _GBRAIN_BIN, "search", str(args.get("consulta", "")), "--limit", "6", "--mode", "conservative", timeout=15.0
-        )
-        if code != 0 or not stdout:
-            result = "(la memoria no respondió)"
+        query = str(args.get("consulta", ""))
+        # Railway cannot reach the Mac's localhost Postgres.  Its curated
+        # snapshot is intentionally read-only and is never allowed to fall
+        # back to a local gbrain CLI there.
+        if os.environ.get("RAILWAY_ENVIRONMENT") or _CURATED_MEMORY_BUNDLE.exists():
+            result = search_curated_memory(_CURATED_MEMORY_BUNDLE, query)
         else:
-            blocks: list[list[str]] = []
-            for line in stdout.splitlines():
-                if re.match(r"^\[\d\.\d+\]", line):
-                    blocks.append([line])
-                elif blocks and line.strip():
-                    blocks[-1].append(line)
-            keep = [block for block in blocks if not re.search(r"\]\s*(skills|daily)/", block[0])][:5]
-            result = "\n\n".join("\n".join(block) for block in keep)[:1800] if keep else "(sin resultados en la memoria)"
+            code, stdout = await _run_local_command(
+                _GBRAIN_BIN, "search", query, "--limit", "6", "--mode", "conservative", timeout=15.0
+            )
+            if code != 0 or not stdout:
+                result = "(la memoria no respondió)"
+            else:
+                blocks: list[list[str]] = []
+                for line in stdout.splitlines():
+                    if re.match(r"^\[\d\.\d+\]", line):
+                        blocks.append([line])
+                    elif blocks and line.strip():
+                        blocks[-1].append(line)
+                keep = [block for block in blocks if not re.search(r"\]\s*(skills|daily)/", block[0])][:5]
+                result = "\n\n".join("\n".join(block) for block in keep)[:1800] if keep else "(sin resultados en la memoria)"
     elif name == "guardar_en_memoria":
         hecho = str(args.get("hecho", ""))[:500].strip()
         if not hecho:
