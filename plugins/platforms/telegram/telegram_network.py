@@ -109,14 +109,24 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                                 "[Telegram] Sticky fallback IP %s failed; resetting to primary DNS path",
                                 ip,
                             )
+                # 2026-07-24: `str(httpx.ConnectTimeout())`/`str(httpx.ConnectError())`
+                # are frequently empty -- the real reason lives in `exc.__cause__`
+                # (the wrapped OS-level error: ConnectionRefusedError, socket
+                # timeout, SSL error, etc.). Every occurrence logged so far showed
+                # up as "connection failed ()" -- diagnostically useless. Log the
+                # exception type + repr + cause so the NEXT real occurrence is
+                # actually attributable instead of another blank parenthesis.
+                detail = f"{type(exc).__name__}: {exc!r}"
+                if exc.__cause__ is not None:
+                    detail += f" <- caused by {type(exc.__cause__).__name__}: {exc.__cause__!r}"
                 if ip is None:
                     logger.warning(
                         "[Telegram] Primary api.telegram.org connection failed (%s); trying fallback IPs %s",
-                        exc,
+                        detail,
                         ", ".join(self._fallback_ips),
                     )
                     continue
-                logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
+                logger.warning("[Telegram] Fallback IP %s failed: %s", ip, detail)
                 continue
 
         if last_error is None:
