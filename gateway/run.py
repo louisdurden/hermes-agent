@@ -10325,6 +10325,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
 
+        # Telegram update_id redelivery guard (FX-150/151, 2026-07-25). Real
+        # risk under Mac-primary/Railway-failover: during the brief window
+        # where a stale-heartbeat promotion overlaps with the still-live Mac
+        # gateway, both processes can end up polling Telegram before one is
+        # kicked out by Telegram's single-active-poller rule (409 Conflict).
+        # That kick is not instantaneous, and even outside failover a plain
+        # network retry can redeliver an update_id Telegram already sent us.
+        # `_is_stale_restart_redelivery` only guards the narrow /restart-loop
+        # case (see below) — this is the general guard so ANY redelivered
+        # update, not just /restart, never produces a second reply.
+        if not is_internal and self._is_duplicate_telegram_update(event):
+            logger.info(
+                "Skipping redelivered Telegram update_id=%s (already processed)",
+                event.platform_update_id,
+            )
+            return None
+
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
         # (background-process completions, startup-restore replays) are NOT
@@ -14244,6 +14261,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+
+    _TELEGRAM_DEDUP_WINDOW_SECONDS = 600
+    _TELEGRAM_DEDUP_MAX_ENTRIES = 500
+
+    def _is_duplicate_telegram_update(self, event: MessageEvent) -> bool:
+        """General idempotency guard: True if this exact Telegram update_id
+        was already processed recently, on THIS process or a prior one.
+
+        Persisted to disk (not just in-memory) on purpose: the scenario this
+        exists for is a process restart/handoff (Mac<->Railway failover, or
+        a plain crash-restart), so an in-memory-only set would be empty
+        exactly when it matters most. Bounded by both count and a 10-minute
+        window so it can never grow unbounded on a long-lived process; 10
+        minutes is generous against the actual failover overlap window
+        (~90-120s, per FX-150's live-verified stale_after) while still
+        cheap to prune.
+
+        Only Telegram populates ``platform_update_id`` today (see
+        MessageEvent) -- other platforms are a no-op here by construction,
+        same scoping as ``_is_stale_restart_redelivery``.
+        """
+        if event is None or event.platform_update_id is None:
+            return False
+        source = getattr(event, "source", None)
+        if source is None or source.platform is None:
+            return False
+        try:
+            platform_value = source.platform.value
+        except Exception:
+            return False
+        if platform_value != "telegram":
+            return False
+
+        path = _hermes_home / ".telegram_processed_updates.json"
+        now = time.time()
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+        except Exception:
+            data = {}
+        entries = data.get("entries", {}) if isinstance(data, dict) else {}
+        entries = {
+            uid: ts
+            for uid, ts in entries.items()
+            if isinstance(ts, (int, float)) and now - ts < self._TELEGRAM_DEDUP_WINDOW_SECONDS
+        }
+
+        key = str(event.platform_update_id)
+        is_duplicate = key in entries
+        if not is_duplicate:
+            entries[key] = now
+            if len(entries) > self._TELEGRAM_DEDUP_MAX_ENTRIES:
+                entries = dict(
+                    sorted(entries.items(), key=lambda kv: kv[1], reverse=True)[
+                        : self._TELEGRAM_DEDUP_MAX_ENTRIES
+                    ]
+                )
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"entries": entries}))
+                os.chmod(tmp, 0o600)
+                tmp.replace(path)
+            except Exception:
+                logger.debug(
+                    "failed to persist telegram update dedup store", exc_info=True
+                )
+        return is_duplicate
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
         """Return True if this /restart is a Telegram re-delivery we already handled.
