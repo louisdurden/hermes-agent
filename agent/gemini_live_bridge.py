@@ -241,10 +241,16 @@ async def _execute_live_tool(name: str, args: Any) -> str:
         elif not events:
             result = "Agenda libre: sin eventos en las próximas 48 horas."
         else:
+            def _format_event(event: dict) -> str:
+                source = event.get("calendario") or event.get("cuenta")
+                suffix = f" [{source}]" if source else ""
+                return (
+                    f"{event.get('inicio', '?')} → {event.get('fin', '?')} · "
+                    f"{event.get('titulo', '(sin título)')}{suffix}"
+                )
+
             result = "\n".join(
-                f"{event.get('inicio', '?')} → {event.get('fin', '?')} · {event.get('titulo', '(sin título)')}"
-                f"{f' [{event.get("calendario") or event.get("cuenta")}]' if event.get('calendario') or event.get('cuenta') else ''}"
-                for event in events if isinstance(event, dict)
+                _format_event(event) for event in events if isinstance(event, dict)
             )[:1800]
     elif name == "crear_recordatorio":
         script = f"""
