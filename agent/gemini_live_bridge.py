@@ -284,20 +284,7 @@ def _load_persona_instruction() -> str:
                 "voz-a-voz nativo (Gemini Live), no por el pipeline de texto habitual. "
                 "En este modo tenes acceso limitado a buscar y guardar memoria, consultar "
                 "la agenda y crear recordatorios. Guarda memoria o crea un recordatorio "
-                "solo ante un pedido explícito de Rodrigo. No afirmes tener otras herramientas. "
-                "RECORDATORIO REFORZADO (FX-156/157, hallazgo real y medido de dos evals de voz "
-                "seguidos: la instrucción abstracta NO alcanzó, seguís cerrando casi toda respuesta "
-                "con una muletilla de disponibilidad — viola tu propia regla de 'un mayordomo "
-                "resuelve y se retira'). Última frase de tu respuesta ANTES de mandarla: si es una "
-                "pregunta que ofrece hacer algo más ('¿hay algo más?', '¿qué tienes en mente?', "
-                "'¿quieres que...?', '¿te gustaría...?', '¿te sirve...?'), BORRÁ esa frase entera y "
-                "terminá en la frase anterior. Ejemplos exactos de esta sesión:\n"
-                "MAL: 'Queda programado para mañana a las 8. ¿Te gustaría que prepare algo más para "
-                "esa llamada?' → BIEN: 'Queda programado para mañana a las 8.'\n"
-                "MAL: 'No tengo acceso a tus cuentas bancarias por este canal. ¿Quieres que revise tu "
-                "agenda por una referencia?' → BIEN: 'No tengo acceso a tus cuentas bancarias por "
-                "este canal.' (si de verdad falta un dato para ACTUAR, no para ofrecer, pedilo una "
-                "sola vez y sin forma de pregunta de cortesía: 'Decime el banco y lo reviso.')"
+                "solo ante un pedido explícito de Rodrigo. No afirmes tener otras herramientas."
             )
     except OSError:
         pass
