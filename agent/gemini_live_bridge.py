@@ -291,6 +291,85 @@ def _load_persona_instruction() -> str:
     return _FALLBACK_PERSONA
 
 
+# FX-165 (2026-07-30): filtro de post-procesamiento para la muletilla de
+# cierre en modo voz (FX-156/157: casi toda respuesta cerraba con una oferta
+# de disponibilidad tipo "¿hay algo más?", violando la regla dura de
+# SOUL.md línea 34 -- "un mayordomo resuelve y se retira"). Dos intentos de
+# arreglarlo por prompt (instrucción abstracta, luego ejemplos MAL/BIEN)
+# EMPEORARON el score medido (3.33 -> 3.06 -> 3.00/5) y se revirtieron
+# (FX-157/158). Recomendación explícita de esa sesión: un filtro de
+# post-procesamiento, no más iteración de prompt -- esto es ese filtro.
+#
+# Gemini Live manda audio nativo (BidiGenerateContent), no texto que pase
+# por un TTS separable -- no hay un paso de "texto final" donde tachar la
+# frase antes de sintetizar voz. El único punto de intervención real es la
+# transcripción en paralelo (`outputAudioTranscription`, agregada al setup
+# más abajo): en cuanto el patrón aparece en el texto acumulado del turno,
+# se deja de reenviar audio/transcripción al cliente para el resto de ESE
+# turno (no corta lo ya sonado en el mismo instante, pero evita que el resto
+# de la muletilla llegue a los parlantes) y se cierra el turno limpio con un
+# `turnComplete` sintético en vez de dejar que termine de decirla entera.
+_CLOSING_FILLER_RE = re.compile(
+    r"("
+    r"algo\s+m[aá]s"
+    r"|espero\s+que\s+esto\s+(te\s+)?ayude"
+    r"|avisa\w*\s+si\s+necesit"
+    r"|cualquier\s+cosa\s+(me\s+)?dec[ií]"
+    r"|quer[eé]s?\s+que\s+lo\s+redacte"
+    r"|estoy\s+aqu[ií]\s+si\s+necesit"
+    r"|hazme\s+saber\s+si"
+    r"|puedo\s+ayudarte\s+con\s+algo"
+    r"|hay\s+algo\s+en\s+que\s+pueda"
+    r")",
+    re.IGNORECASE,
+)
+
+
+_CLOSING_FILLER_TAIL_CHARS = 80
+_MIN_SUBSTANTIVE_PREFIX_CHARS = 15
+
+
+def _contains_closing_filler(accumulated_text: str) -> bool:
+    """True si el turno ya delata la muletilla prohibida (SOUL.md: 'un
+    mayordomo resuelve y se retira').
+
+    Dos mecanismos, no uno solo -- verificado contra 6 respuestas reales
+    (FX-165, corrida del harness): Gemini frasea la violación de mil formas
+    distintas ("¿querés que te ayude a...?", "¿te gustaría que...?", "¿en qué
+    aspecto...?") -- ninguna coincide con una lista fija de frases, así que
+    una lista de patrones sola tiene recall bajo.
+
+    1) Heurística GENERAL (la que realmente atrapa la mayoría de los casos
+       reales): la respuesta ya cerró una oración real (termina en `. `, `! `
+       o `? ` antes del final) y el turno completo TERMINA en una pregunta
+       nueva -- eso es casi siempre una oferta/pregunta de cierre no pedida,
+       sea cual sea la redacción exacta. Una pregunta que es TODA la
+       respuesta (sin nada sustantivo antes) no cuenta -- puede ser una
+       aclaración legítima necesaria.
+    2) Lista de frases fijas como red de seguridad para variantes cortas que
+       la heurística general no alcanza a distinguir (ej. "¿algo más?" pegado
+       a una oración muy corta, por debajo del umbral de "sustantivo").
+
+    Se llama con el texto acumulado del turno (no por-chunk) porque la frase
+    puede partirse entre chunks de transcripción.
+    """
+    tail = accumulated_text.rstrip()
+    if not tail:
+        return False
+
+    if tail.endswith("?"):
+        body = tail[:-1]
+        last_boundary = max(body.rfind("."), body.rfind("!"), body.rfind("?"))
+        if last_boundary >= _MIN_SUBSTANTIVE_PREFIX_CHARS:
+            return True
+
+    # Red de seguridad: frases fijas conocidas, solo en la cola (la muletilla
+    # es por definición un cierre; "algo más" suelto puede aparecer
+    # legítimamente a mitad de una respuesta real).
+    window = tail[-_CLOSING_FILLER_TAIL_CHARS:]
+    return bool(_CLOSING_FILLER_RE.search(window))
+
+
 class GeminiLiveSession:
     """Un puente activo cliente(Desktop) <-> Gemini Live, con reconexión.
 
@@ -394,6 +473,12 @@ class GeminiLiveSession:
                     },
                     "systemInstruction": {"parts": [{"text": self._persona}]},
                     "tools": [{"functionDeclarations": self._live_tool_declarations()}],
+                    # FX-165: transcripción en paralelo al audio -- único punto de
+                    # intervención real para el filtro de muletilla de cierre (ver
+                    # _contains_closing_filler más arriba). No agrega otro modality,
+                    # solo texto en `serverContent.outputTranscription.text` junto
+                    # al audio que ya se manda.
+                    "outputAudioTranscription": {},
                     # Habilita que Gemini nos mande sessionResumptionUpdate en
                     # cada turno; guardamos el handle más reciente para poder
                     # retomar la MISMA sesión lógica en la próxima reconexión
@@ -406,6 +491,11 @@ class GeminiLiveSession:
                 await upstream.send(json.dumps({"setup": setup}))
 
                 pump_task = asyncio.create_task(pump_fn(upstream, stop_event))
+
+                # FX-165: estado del filtro de muletilla de cierre, vive por-turno
+                # (se resetea en cada turnComplete real).
+                turn_transcript = ""
+                turn_muted = False
 
                 try:
                     async for raw in upstream:
@@ -432,7 +522,37 @@ class GeminiLiveSession:
                             await self._reply_to_tool_call(upstream, parsed["toolCall"])
                             continue
 
-                        await client_ws.send_text(text)
+                        # FX-165: filtro de muletilla de cierre. Acumulamos la
+                        # transcripción del turno en curso; en cuanto el patrón
+                        # aparece, dejamos de reenviar audio/transcripción al
+                        # cliente para el resto de ESTE turno (no des-suena lo ya
+                        # emitido, pero corta el resto de la frase antes de que
+                        # termine de sonar) y cerramos el turno con un
+                        # turnComplete sintético en vez del real de Gemini.
+                        server_content = parsed.get("serverContent", {})
+                        chunk_text = server_content.get("outputTranscription", {}).get("text", "")
+                        if chunk_text:
+                            turn_transcript += chunk_text
+
+                        real_turn_complete = bool(server_content.get("turnComplete"))
+
+                        if not turn_muted and chunk_text and _contains_closing_filler(turn_transcript):
+                            turn_muted = True
+                            print(
+                                f"[gemini_live] muletilla de cierre detectada y cortada "
+                                f"(SOUL.md: 'resuelve y se retira'): {turn_transcript!r}",
+                                flush=True,
+                            )
+                            await client_ws.send_text(json.dumps({"serverContent": {"turnComplete": True}}))
+                        elif not turn_muted:
+                            await client_ws.send_text(text)
+                        # turn_muted=True: se suprime este mensaje por completo
+                        # (audio y transcripción) -- el cliente ya recibió su
+                        # turnComplete sintético y no espera más para este turno.
+
+                        if real_turn_complete:
+                            turn_transcript = ""
+                            turn_muted = False
 
                         if "goAway" in parsed:
                             goaway = True

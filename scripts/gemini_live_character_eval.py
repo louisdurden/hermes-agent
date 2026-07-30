@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent.gemini_live_bridge import (  # noqa: E402
     GEMINI_LIVE_MODEL,
     GeminiLiveSession,
+    _contains_closing_filler,
     _execute_live_tool,
     _load_persona_instruction,
 )
@@ -173,7 +174,7 @@ class GeminiLiveTextEvalSession:
         self._api_key = api_key
         self._persona = _load_persona_instruction()
 
-    async def send_turn(self, text: str) -> tuple[str, float, list[str]]:
+    async def send_turn(self, text: str) -> tuple[str, float, list[str], bool]:
         import websockets
 
         url = GEMINI_WS_URL_TEMPLATE.format(key=self._api_key)
@@ -211,6 +212,25 @@ class GeminiLiveTextEvalSession:
                 }
             }))
 
+            # FX-165: mide el efecto real del filtro de post-procesamiento de
+            # gemini_live_bridge.py -- se aplica la MISMA función
+            # (_contains_closing_filler, importada, no reimplementada) sobre la
+            # transcripción acumulada.
+            #
+            # Nota real de esta corrida (primer intento): dejar el fragmento
+            # colgado tal cual quedó cortado (ej. "¿Hay algo más" sin cerrar)
+            # bajó el score -- el juez de TEXTO ve ese resto como evidencia de
+            # la violación igual, aunque en AUDIO real el corte hubiera sido
+            # antes de terminar de decirla. Eso es un problema de qué tan
+            # prolijo suena el corte en tiempo real (fuera del alcance de este
+            # harness de texto, documentado como límite en el docstring del
+            # módulo), no de si el filtro cumple su propósito real: que la
+            # respuesta NÚCLEO (sin el agregado prohibido) sea correcta por sí
+            # sola. Por eso acá se trunca de vuelta al último punto de
+            # oración limpio ANTES del agregado, en vez de dejar el fragmento
+            # colgado -- así el score mide lo que de verdad importa.
+            filler_cut = False
+            last_clean_boundary = -1  # posición del último '. '/'! '/'? ' completo
             async for raw in upstream:
                 msg_text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
                 parsed = json.loads(msg_text)
@@ -226,14 +246,28 @@ class GeminiLiveTextEvalSession:
 
                 server_content = parsed.get("serverContent", {})
                 transcription = server_content.get("outputTranscription", {})
-                if transcription.get("text"):
-                    answer_parts.append(transcription["text"])
+                chunk_text = transcription.get("text", "")
+                if chunk_text and not filler_cut:
+                    answer_parts.append(chunk_text)
+                    joined = "".join(answer_parts)
+                    if _contains_closing_filler(joined):
+                        filler_cut = True
+                    else:
+                        for terminator in (". ", "! ", "? "):
+                            pos = joined.rfind(terminator)
+                            if pos > last_clean_boundary:
+                                last_clean_boundary = pos
 
                 if server_content.get("turnComplete"):
                     break
 
         elapsed = time.monotonic() - started
-        return "".join(answer_parts).strip(), elapsed, tool_calls
+        full_answer = "".join(answer_parts).strip()
+        if filler_cut and last_clean_boundary >= 0:
+            # trunca al último punto de oración limpio (incluye el signo,
+            # descarta el agregado prohibido entero, no un resto colgado)
+            full_answer = "".join(answer_parts)[: last_clean_boundary + 1].strip()
+        return full_answer, elapsed, tool_calls, filler_cut
 
     @staticmethod
     async def _reply_stub(upstream, tool_call: dict[str, Any]) -> None:
@@ -263,13 +297,15 @@ async def main() -> int:
     for scenario in SCENARIOS:
         try:
             session = session_factory()
-            answer, elapsed, tool_calls = await session.send_turn(scenario.turno)
+            answer, elapsed, tool_calls, filler_cut = await session.send_turn(scenario.turno)
             score = judge(scenario, answer, elapsed, tool_calls)
             avg = (score["personalidad"] + score["rasgo_objetivo"] + score["concision_oral"]) / 3
             rows.append({"id": scenario.id, "rasgo": scenario.rasgo, "score": avg, **score,
-                         "answer": answer, "latency_s": elapsed, "tool_calls": tool_calls})
+                         "answer": answer, "latency_s": elapsed, "tool_calls": tool_calls,
+                         "filler_cut": filler_cut})
             print(f"#{scenario.id} [{scenario.rasgo}] {avg:.2f}/5 — {score['veredicto']} "
-                  f"(latencia {elapsed:.1f}s, tools={tool_calls or '-'})")
+                  f"(latencia {elapsed:.1f}s, tools={tool_calls or '-'}"
+                  f"{', muletilla cortada' if filler_cut else ''})")
             print(f"   A: {answer[:200]}")
         except Exception as exc:  # noqa: BLE001
             excluded.append({"id": scenario.id, "rasgo": scenario.rasgo, "reason": repr(exc)})
