@@ -200,7 +200,7 @@ async def _execute_live_tool(name: str, args: Any) -> str:
             result = search_curated_memory(_CURATED_MEMORY_BUNDLE, query)
         else:
             code, stdout = await _run_local_command(
-                _GBRAIN_BIN, "search", query, "--limit", "6", "--mode", "conservative", timeout=15.0
+                _GBRAIN_BIN, "search", query, "--limit", "6", "--mode", "conservative", timeout=25.0
             )
             if code != 0 or not stdout:
                 result = "(la memoria no respondió)"
@@ -226,8 +226,12 @@ async def _execute_live_tool(name: str, args: Any) -> str:
             # `--content` (verificado corriendo el CLI real: con `--content` como
             # argumento posicional el comando sale con exit 0 pero no crea nada
             # -- fallo silencioso. El contenido va como input_text.
+            # FX-169: `gbrain put` mide 20-22s real (medido en vivo,
+            # 3/3 corridas) contra un timeout previo de 15.0s -- fallaba
+            # sistemáticamente por timeout, no por un error real de gbrain.
+            # 35s deja margen real sobre lo medido.
             code, _stdout = await _run_local_command(
-                _GBRAIN_BIN, "put", f"facts/{category}/{timestamp}", input_text=content, timeout=15.0
+                _GBRAIN_BIN, "put", f"facts/{category}/{timestamp}", input_text=content, timeout=35.0
             )
             result = "Guardado en memoria ✓" if code == 0 else "(no pude guardar en la memoria)"
     elif name == "agenda_hoy":
