@@ -33,7 +33,7 @@ import nodePty from 'node-pty'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, normalizeHermesHomeRoot, resolveBackendVenvRoot } from './backend-env'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
@@ -3439,7 +3439,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     return null
   }
 
-  const venvRoot = path.join(root, 'venv')
+  const venvRoot = resolveBackendVenvRoot(root, python)
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
 

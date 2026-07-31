@@ -9,7 +9,8 @@ import {
   buildDesktopBackendPath,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  resolveBackendVenvRoot
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
@@ -103,4 +104,48 @@ test('Windows PATH casing and delimiter are preserved without POSIX sane entries
 
 test('appendUniquePathEntries drops empty entries and keeps first occurrence', () => {
   assert.equal(appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }), '/a:/b:/c')
+})
+
+test('source backend pairs the selected interpreter with its own virtual environment', () => {
+  const cases = [
+    {
+      name: 'POSIX .venv',
+      root: '/repo/hermes-agent',
+      python: '/repo/hermes-agent/.venv/bin/python',
+      expected: '/repo/hermes-agent/.venv',
+      pathModule: path.posix
+    },
+    {
+      name: 'POSIX venv',
+      root: '/repo/hermes-agent',
+      python: '/repo/hermes-agent/venv/bin/python',
+      expected: '/repo/hermes-agent/venv',
+      pathModule: path.posix
+    },
+    {
+      name: 'Windows .venv',
+      root: 'C:\\repo\\hermes-agent',
+      python: 'C:\\repo\\hermes-agent\\.venv\\Scripts\\python.exe',
+      expected: 'C:\\repo\\hermes-agent\\.venv',
+      pathModule: path.win32
+    },
+    {
+      name: 'external interpreter fallback',
+      root: '/repo/hermes-agent',
+      python: '/opt/python/bin/python',
+      expected: '/repo/hermes-agent/venv',
+      pathModule: path.posix
+    },
+    {
+      name: 'sibling prefix fallback',
+      root: '/repo/hermes-agent',
+      python: '/repo/hermes-agent/.venv-old/bin/python',
+      expected: '/repo/hermes-agent/venv',
+      pathModule: path.posix
+    }
+  ]
+
+  for (const { name, root, python, expected, pathModule } of cases) {
+    assert.equal(resolveBackendVenvRoot(root, python, { pathModule }), expected, name)
+  }
 })

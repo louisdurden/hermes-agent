@@ -90,6 +90,25 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
   return resolved
 }
 
+function resolveBackendVenvRoot(
+  root,
+  python,
+  { pathModule = pathModuleForPlatform(process.platform) }: any = {}
+) {
+  const resolvedPython = pathModule.resolve(String(python || ''))
+
+  for (const name of ['.venv', 'venv']) {
+    const candidate = pathModule.resolve(root, name)
+    const relative = pathModule.relative(candidate, resolvedPython)
+
+    if (relative && !relative.startsWith('..') && !pathModule.isAbsolute(relative)) {
+      return candidate
+    }
+  }
+
+  return pathModule.resolve(root, 'venv')
+}
+
 function buildDesktopBackendEnv({
   hermesHome,
   pythonPathEntries = [],
@@ -121,5 +140,6 @@ export {
   delimiterForPlatform,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  resolveBackendVenvRoot
 }
