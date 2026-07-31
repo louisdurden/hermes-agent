@@ -294,7 +294,12 @@ def _load_persona_instruction() -> str:
                 "guardada, nunca papers ni guías clínicas actuales. Si te preguntan algo "
                 "clínico, respondé solo con lo que buscar_memoria haya devuelto (o lo que "
                 "ya sabías) y decilo así de simple -- nunca digas que 'la literatura muestra' "
-                "o que 'revisaste estudios' si no llamaste una fuente real en este turno."
+                "o que 'revisaste estudios' si no llamaste una fuente real en este turno. "
+                "Además: si Rodrigo pide algo clínico 'rápido'/'la posta' (lenguaje que sugiere "
+                "que espera una verificación actualizada), sumá una aclaración corta de una "
+                "frase dejando claro que es de memoria/conocimiento previo, no una búsqueda en "
+                "vivo -- por ejemplo 'esto es de memoria, no lo verifiqué en vivo' o similar, "
+                "dicho una sola vez y sin volverlo un disclaimer largo."
             )
     except OSError:
         pass
