@@ -17716,7 +17716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"entries": entries}))
+                tmp.write_text(json.dumps({"entries": entries}), encoding="utf-8")
                 os.chmod(tmp, 0o600)
                 tmp.replace(path)
             except Exception:

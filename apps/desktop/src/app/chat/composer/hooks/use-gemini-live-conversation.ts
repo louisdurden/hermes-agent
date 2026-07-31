@@ -1,6 +1,5 @@
-import { useCallback, useRef, useState } from 'react'
-
 import { resolveGatewayWsUrl } from '@hermes/shared'
+import { useCallback, useRef, useState } from 'react'
 
 import { notifyError } from '@/store/notifications'
 
@@ -60,6 +59,7 @@ export function useGeminiLiveConversation() {
         // ya terminó / ya estaba detenida
       }
     }
+
     scheduledSourcesRef.current = []
     nextPlayAtRef.current = playContextRef.current?.currentTime ?? 0
   }, [])
@@ -73,7 +73,9 @@ export function useGeminiLiveConversation() {
     const buffer = context.createBuffer(1, int16.length, sampleRate)
     const channel = buffer.getChannelData(0)
 
-    for (let i = 0; i < int16.length; i += 1) channel[i] = int16[i] / 32_768
+    for (let i = 0; i < int16.length; i += 1) {
+      channel[i] = int16[i] / 32_768
+    }
 
     const source = context.createBufferSource()
     source.buffer = buffer
@@ -87,7 +89,10 @@ export function useGeminiLiveConversation() {
 
     source.onended = () => {
       scheduledSourcesRef.current = scheduledSourcesRef.current.filter((s) => s !== source)
-      if (scheduledSourcesRef.current.length === 0) setStatus('listening')
+
+      if (scheduledSourcesRef.current.length === 0) {
+        setStatus('listening')
+      }
     }
   }, [])
 
@@ -110,7 +115,9 @@ export function useGeminiLiveConversation() {
       processor.connect(context.destination)
 
       processor.onaudioprocess = (event) => {
-        if (!runningRef.current || ws.readyState !== WebSocket.OPEN) return
+        if (!runningRef.current || ws.readyState !== WebSocket.OPEN) {
+          return
+        }
 
         const input = event.inputBuffer.getChannelData(0)
         const ratio = context.sampleRate / 16_000
@@ -125,7 +132,9 @@ export function useGeminiLiveConversation() {
         const bytes = new Uint8Array(out.buffer)
         let binary = ''
 
-        for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i])
+        for (let i = 0; i < bytes.length; i += 1) {
+          binary += String.fromCharCode(bytes[i])
+        }
 
         ws.send(
           JSON.stringify({ realtimeInput: { audio: { data: btoa(binary), mimeType: 'audio/pcm;rate=16000' } } })
@@ -143,6 +152,7 @@ export function useGeminiLiveConversation() {
       } catch {
         // ya desconectado
       }
+
       micProcessorRef.current = null
     }
 
@@ -213,7 +223,9 @@ export function useGeminiLiveConversation() {
             const binary = atob(part.inlineData.data)
             const bytes = new Uint8Array(binary.length)
 
-            for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+            for (let i = 0; i < binary.length; i += 1) {
+              bytes[i] = binary.charCodeAt(i)
+            }
 
             const rate = Number(part.inlineData.mimeType?.match(/rate=(\d+)/)?.[1] ?? 24_000)
 

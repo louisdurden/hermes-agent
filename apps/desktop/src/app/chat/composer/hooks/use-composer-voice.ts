@@ -252,8 +252,11 @@ export function useComposerVoice({
   // Completamente independiente del estado de `conversation`: cero riesgo de
   // interferir con el modo cascada existente si este todavía no se usa.
   const geminiLive = useGeminiLiveConversation()
+
   const toggleGeminiLive = useCallback(() => {
-    if (disabled) return
+    if (disabled) {
+      return
+    }
 
     if (geminiLive.status === 'idle' || geminiLive.status === 'error') {
       void geminiLive.start()

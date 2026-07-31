@@ -4673,7 +4673,7 @@ class BasePlatformAdapter(ABC):
         for Slack's Assistant API where ``assistant_threads_setStatus`` disables
         the compose box — pausing lets the user type ``/approve`` or ``/deny``.
 
-        Each ``send_typing`` call is bounded by a ~1.5s timeout so a slow
+        Each ``send_typing`` call is bounded below the refresh interval so a slow
         network round-trip can't stall the refresh cadence.  Telegram- and
         Discord-side typing expire after ~5s; if any individual send_typing
         takes longer than the refresh interval, the bubble would die and
@@ -4682,25 +4682,10 @@ class BasePlatformAdapter(ABC):
         one of them succeeds within the 5s platform-side window, the bubble
         stays visible across provider stalls / upstream API timeouts.
         """
-        # Bound each send_typing round-trip so a truly stuck call can't wedge
-        # the loop forever, but stay well under Telegram/Discord's ~5s expiry
-        # so a normal-but-not-instant round-trip isn't abandoned before it
-        # even has a chance to land.
-        #
-        # 2026-07-25: this was previously `min(1.5, interval - 0.25)` — with
-        # the default interval=2.0 that's a hard 1.5s cap. Measured against
-        # the real Telegram Bot API tonight (5 back-to-back getMe calls,
-        # same network as this gateway): 0.77s/0.83s/0.91s/0.94s/**2.68s**.
-        # One real call in five already exceeded 1.5s outright — meaning the
-        # typing indicator was being silently killed by this timeout on a
-        # meaningful fraction of ticks, not a rare edge case. That's why the
-        # "escribiendo…" bubble never appeared despite the loop demonstrably
-        # spawning correctly (confirmed by code trace: typing_indicator
-        # defaults True, _keep_typing is created in the message-start path).
-        # A slow tick here no longer means "dead", just "the next tick is a
-        # bit late" -- still fine since the loop is sequential (await inside
-        # `while True`), not concurrent, so nothing stacks up.
-        _send_typing_timeout = max(0.25, min(4.0, interval + 2.0))
+        # Bound each send_typing round-trip below the cadence so a stuck call
+        # cannot delay the next refresh.  The default remains 1.5s for a 2s
+        # interval while shorter test/custom intervals retain the same margin.
+        _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
