@@ -161,7 +161,11 @@ def judge(scenario: Scenario, answer: str, latency_s: float, tool_calls: list[st
             "messages": [{"role": "user", "content": prompt}],
         },
     )
-    text = resp["content"][0]["text"]
+    blocks = resp.get("content") or []
+    text_block = next((b for b in blocks if b.get("type") == "text"), None)
+    if text_block is None:
+        raise RuntimeError(f"respuesta del juez sin bloque de texto: {resp}")
+    text = text_block["text"]
     start = text.find("{")
     end = text.rfind("}") + 1
     return json.loads(text[start:end])

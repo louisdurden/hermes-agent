@@ -83,7 +83,7 @@ _LIVE_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "guardar_en_memoria",
-        "description": "Guarda un hecho o decisión no sensible en la memoria permanente. Nunca uses para PHI ni secretos.",
+        "description": "Guarda un hecho o decisión no sensible en la memoria permanente, para recordarlo en el futuro como contexto (aunque el hecho mencione una fecha u hora, ej. una reunión, un evento, un plan). Úsala salvo que Rodrigo pida explícitamente que le avisen/notifiquen en ese momento futuro -- en ese caso usá crear_recordatorio en cambio. Nunca uses para PHI ni secretos.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -100,7 +100,7 @@ _LIVE_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "crear_recordatorio",
-        "description": "Crea un recordatorio que Alfred enviará por Telegram a la hora indicada. Úsala solamente ante un pedido explícito de Rodrigo.",
+        "description": "Crea un recordatorio que Alfred enviará por Telegram a la hora indicada. Úsala SOLO cuando Rodrigo pide explícitamente que le avisen/notifiquen/recuerden en ese momento ('avisame', 'recordame en su momento', 'notificame'). Si solo dice 'acordate de esto' o pide guardar un hecho -- aunque tenga fecha -- usá guardar_en_memoria en cambio, no esta.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -284,7 +284,13 @@ def _load_persona_instruction() -> str:
                 "voz-a-voz nativo (Gemini Live), no por el pipeline de texto habitual. "
                 "En este modo tenes acceso limitado a buscar y guardar memoria, consultar "
                 "la agenda y crear recordatorios. Guarda memoria o crea un recordatorio "
-                "solo ante un pedido explícito de Rodrigo. No afirmes tener otras herramientas."
+                "solo ante un pedido explícito de Rodrigo. No afirmes tener otras herramientas. "
+                "En particular: en este modo NO tenes scite ni consensus ni ninguna búsqueda "
+                "de literatura en tiempo real -- buscar_memoria solo consulta tu memoria "
+                "guardada, nunca papers ni guías clínicas actuales. Si te preguntan algo "
+                "clínico, respondé solo con lo que buscar_memoria haya devuelto (o lo que "
+                "ya sabías) y decilo así de simple -- nunca digas que 'la literatura muestra' "
+                "o que 'revisaste estudios' si no llamaste una fuente real en este turno."
             )
     except OSError:
         pass
