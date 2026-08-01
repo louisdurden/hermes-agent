@@ -909,13 +909,11 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` is retained for API compatibility.  Startup recovery is
+    autonomous on every platform: an empty message means no NEW user request
+    exists, so the interrupted task must continue without asking a human to
+    reconstruct state.  Tool calls with missing results are ambiguous and must
+    be verified read-only before any retry.
     """
     reason_phrase = (
         "a gateway restart"
@@ -933,26 +931,18 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion."
+            "No new user message is present. CONTINUE the interrupted task "
+            "to completion from the durable conversation and session state; "
+            "do not ask the user to reconstruct or repeat prior work."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step "
-            "that has no recorded result."
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history. If a tool call has no recorded result and may have had "
+            "external side effects, treat its outcome as ambiguous: inspect "
+            "current state with read-only tools before deciding whether a "
+            "retry is necessary."
         )
     return (
         f"[System note: The previous turn was interrupted by "
@@ -3251,6 +3241,27 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _should_inject_resume_pending(
+    resume_entry: Any,
+    *,
+    inherited_at_turn_start: bool,
+    interruption_is_fresh: bool,
+    resume_mark_is_fresh: bool,
+) -> bool:
+    """Return whether recovery guidance belongs to this turn.
+
+    An active turn writes a resume marker before hooks/tools run.  That marker
+    is for a future process after an abrupt death; the same normal turn must not
+    misread its own marker as evidence of an earlier restart.
+    """
+    return bool(
+        inherited_at_turn_start
+        and resume_entry is not None
+        and getattr(resume_entry, "resume_pending", False)
+        and (interruption_is_fresh or resume_mark_is_fresh)
+    )
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -4954,10 +4965,11 @@ class TurnRunner:
                 getattr(_resume_entry, "last_resume_marked_at", None),
                 window_secs=_freshness_window,
             )
-        _is_resume_pending = bool(
-            _resume_entry is not None
-            and getattr(_resume_entry, "resume_pending", False)
-            and (_interruption_is_fresh or _resume_mark_is_fresh)
+        _is_resume_pending = _should_inject_resume_pending(
+            _resume_entry,
+            inherited_at_turn_start=ctx.resume_pending_at_turn_start,
+            interruption_is_fresh=_interruption_is_fresh,
+            resume_mark_is_fresh=_resume_mark_is_fresh,
         )
         _has_fresh_tool_tail = bool(
             agent_history
@@ -5016,6 +5028,7 @@ class TurnRunner:
         if (
             isinstance(ctx.message, str)
             and not ctx.message.strip()
+            and ctx.resume_pending_at_turn_start
             and _resume_entry is not None
             and getattr(_resume_entry, "resume_pending", False)
         ):
@@ -5875,6 +5888,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Successful non-streaming results waiting for the adapter to establish
+        # a durable delivery handoff. Failed/partial turns never enter this set.
+        self._resume_delivery_handoff_ready: Dict[str, str] = {}
+        self._startup_inbound_by_session: Dict[str, List[Dict[str, Any]]] = {}
+        self._continuity_session_aliases: Dict[str, str] = {}
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -9410,6 +9428,247 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _complete_resume_delivery_handoff(
+        self, session_key: str, turn_id: Optional[str]
+    ) -> bool:
+        """Clear a turn marker only when a successful result authorized it."""
+        if (
+            not turn_id
+            or self._resume_delivery_handoff_ready.get(turn_id) != session_key
+        ):
+            return False
+        try:
+            cleared = await self.async_session_store.clear_resume_pending(
+                session_key
+            )
+        except Exception:
+            logger.debug(
+                "clear_resume_pending handoff failed for %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+        if cleared:
+            self._resume_delivery_handoff_ready.pop(turn_id, None)
+        return bool(cleared)
+
+    async def _prepare_inbound_turn(
+        self, event: MessageEvent, session_key: str
+    ) -> Optional[str]:
+        """Persist a normalized inbound event before any processing hook."""
+        if event.is_command():
+            return None
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        existing = metadata.get("_hermes_turn_id")
+        if isinstance(existing, str) and existing:
+            return existing
+
+        canonical_session_key = getattr(
+            self, "_continuity_session_aliases", {}
+        ).get(session_key, session_key)
+        source = event.source
+        payload = {
+            "text": event.text or "",
+            "message_type": getattr(event.message_type, "value", str(event.message_type)),
+            "message_id": event.message_id,
+            "platform_update_id": event.platform_update_id,
+            "media_urls": list(event.media_urls or []),
+            "media_types": list(event.media_types or []),
+            "reply_to_message_id": event.reply_to_message_id,
+            "reply_to_text": event.reply_to_text,
+            "channel_context": event.channel_context,
+            "internal": bool(event.internal),
+            "timestamp": event.timestamp.isoformat(),
+            "source": source.to_dict() if source is not None else None,
+        }
+        from gateway.delivery_ledger import (
+            compute_inbound_turn_id,
+            record_inbound_turn,
+        )
+
+        message_ref = str(
+            event.platform_update_id
+            if event.platform_update_id is not None
+            else event.message_id or ""
+        )
+        turn_id = compute_inbound_turn_id(
+            canonical_session_key, message_ref, payload
+        )
+        await asyncio.to_thread(
+            record_inbound_turn,
+            turn_id=turn_id,
+            session_key=canonical_session_key,
+            platform=str(getattr(source.platform, "value", source.platform)),
+            chat_id=source.chat_id,
+            thread_id=getattr(source, "thread_id", None),
+            payload=payload,
+        )
+        metadata["_hermes_turn_id"] = turn_id
+        return turn_id
+
+    async def _recover_inbound_turns(self) -> int:
+        """Claim and replay normalized events left by a dead gateway."""
+        from gateway.delivery_ledger import (
+            delivery_plan_complete,
+            delivery_plan_exists,
+            delivery_plan_terminal,
+            mark_inbound_turn_completed,
+            release_inbound_turn_claim,
+            session_has_delivery_plan,
+            sweep_recoverable_inbound_turns,
+        )
+
+        platform_names = {
+            str(getattr(platform, "value", platform)) for platform in self.adapters
+        }
+        rows = await asyncio.to_thread(
+            sweep_recoverable_inbound_turns,
+            deliverable_platforms=platform_names,
+        )
+        recovered = 0
+        entries = getattr(getattr(self, "session_store", None), "_entries", {})
+        for row in rows:
+            session_key = str(row["session_key"])
+            turn_id = str(row["turn_id"])
+            plan_exists = await asyncio.to_thread(delivery_plan_exists, turn_id)
+            if plan_exists and await asyncio.to_thread(
+                delivery_plan_terminal, turn_id
+            ):
+                plan_complete = await asyncio.to_thread(
+                    delivery_plan_complete, turn_id
+                )
+                store = getattr(self, "_async_session_store", None)
+                if store is None:
+                    store = getattr(self, "session_store", None)
+                clear_pending = getattr(store, "clear_resume_pending", None)
+                cleared = False
+                if callable(clear_pending):
+                    result = clear_pending(session_key)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    cleared = bool(result)
+                if cleared:
+                    await asyncio.to_thread(mark_inbound_turn_completed, turn_id)
+                    recovered += 1
+                    if not plan_complete:
+                        logger.error(
+                            "abandoned delivery plan finalized without agent replay: %s",
+                            turn_id,
+                        )
+                continue
+            if plan_exists:
+                # Component redelivery owns this turn. Re-running the agent
+                # would duplicate tool effects and collide with the saved plan.
+                continue
+            if await asyncio.to_thread(session_has_delivery_plan, session_key):
+                # Another turn still owns delivery for this session. Keep this
+                # inbound replayable, but do not run a new agent concurrently.
+                await asyncio.to_thread(release_inbound_turn_claim, turn_id)
+                continue
+            entry = entries.get(session_key) if isinstance(entries, dict) else None
+            if entry is not None and bool(getattr(entry, "resume_pending", False)):
+                self._startup_inbound_by_session.setdefault(session_key, []).append(row)
+                recovered += 1
+                continue
+
+            payload = row["payload"]
+            source_data = payload.get("source") or {}
+            try:
+                platform = Platform(str(source_data.get("platform") or row["platform"]))
+            except ValueError:
+                logger.warning(
+                    "Skipping inbound recovery %s: unknown platform %r",
+                    row["turn_id"],
+                    source_data.get("platform") or row["platform"],
+                )
+                await asyncio.to_thread(release_inbound_turn_claim, turn_id)
+                continue
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                await asyncio.to_thread(release_inbound_turn_claim, turn_id)
+                continue
+            source = SessionSource.from_dict(
+                {
+                    **source_data,
+                    "platform": platform.value,
+                    "chat_id": source_data.get("chat_id") or row["chat_id"],
+                    "thread_id": source_data.get("thread_id") or row.get("thread_id"),
+                }
+            )
+            try:
+                message_type = MessageType(payload.get("message_type") or "text")
+            except ValueError:
+                message_type = MessageType.TEXT
+            timestamp_raw = payload.get("timestamp")
+            try:
+                timestamp = datetime.fromisoformat(timestamp_raw) if timestamp_raw else datetime.now()
+            except (TypeError, ValueError):
+                timestamp = datetime.now()
+            event = MessageEvent(
+                text=payload.get("text") or "",
+                message_type=message_type,
+                source=source,
+                message_id=payload.get("message_id"),
+                platform_update_id=payload.get("platform_update_id"),
+                media_urls=list(payload.get("media_urls") or []),
+                media_types=list(payload.get("media_types") or []),
+                reply_to_message_id=payload.get("reply_to_message_id"),
+                reply_to_text=payload.get("reply_to_text"),
+                channel_context=payload.get("channel_context"),
+                internal=bool(payload.get("internal")),
+                timestamp=timestamp,
+                metadata={
+                    "_hermes_turn_id": row["turn_id"],
+                    "_hermes_inbound_replay": True,
+                },
+            )
+            try:
+                await adapter.handle_message(event)
+            except Exception:
+                await asyncio.to_thread(release_inbound_turn_claim, turn_id)
+                logger.exception(
+                    "Recovered inbound %s was rejected by adapter; claim released",
+                    turn_id,
+                )
+                continue
+            recovered += 1
+        return recovered
+
+    async def _complete_inbound_turn(self, event: MessageEvent) -> bool:
+        metadata = getattr(event, "metadata", None) or {}
+        turn_ids = metadata.get("_hermes_inbound_turn_ids") or [
+            metadata.get("_hermes_turn_id")
+        ]
+        turn_ids = [turn_id for turn_id in turn_ids if isinstance(turn_id, str) and turn_id]
+        if not turn_ids:
+            return False
+        from gateway.delivery_ledger import mark_inbound_turn_completed
+
+        for turn_id in dict.fromkeys(turn_ids):
+            await asyncio.to_thread(mark_inbound_turn_completed, turn_id)
+        return True
+
+    async def _release_inbound_event_claims(self, event: MessageEvent) -> int:
+        """Release WAL ownership when an adapter did not assume the event."""
+        metadata = getattr(event, "metadata", None) or {}
+        turn_ids = metadata.get("_hermes_inbound_turn_ids") or [
+            metadata.get("_hermes_turn_id")
+        ]
+        from gateway.delivery_ledger import release_inbound_turn_claim
+
+        released = 0
+        for turn_id in dict.fromkeys(
+            candidate
+            for candidate in turn_ids
+            if isinstance(candidate, str) and candidate
+        ):
+            if await asyncio.to_thread(release_inbound_turn_claim, turn_id):
+                released += 1
+        return released
+
     async def _launch_detached_restart_command(self) -> None:
         import shutil
         import subprocess
@@ -9727,10 +9986,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # .clean_shutdown marker); "turn_in_progress" is persisted at the start
+    # of every canonical gateway turn so SIGKILL/power-loss recovery does not
+    # depend on graceful shutdown getting CPU time.  All four mean "the agent
+    # was mid-turn and we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "turn_in_progress",
+        }
     )
 
     async def _run_startup_resume_event(
@@ -9748,12 +10014,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message can race the restore turn immediately after ``handle_message``
         returns.
         """
+        accepted_by_adapter = False
         try:
             await adapter.handle_message(event)
+            accepted_by_adapter = True
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
             if task is not None:
                 await asyncio.shield(task)
+        except Exception:
+            if not accepted_by_adapter:
+                await self._release_inbound_event_claims(event)
+            raise
         finally:
             # _schedule_resume_pending_sessions pre-claims the runner slot
             # before spawning this task.  If adapter.handle_message raises
@@ -9764,6 +10036,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(session_key)
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
+        event.metadata["_hermes_inbound_completion_deferred"] = True
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = []
@@ -9790,18 +10063,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = getattr(event, "source", None)
             adapter = self._adapter_for_source(source)
             if adapter is None:
-                logger.debug(
-                    "Dropping startup-restore queued message: adapter unavailable for %s",
+                logger.warning(
+                    "Deferring startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
+                await self._release_inbound_event_claims(event)
                 continue
             # Mark this replay so _handle_message does not queue it again while
             # the restore gate remains closed for any fresh inbound arrivals.
             try:
                 setattr(event, "_hermes_startup_restore_replay", True)
+                event.metadata.pop("_hermes_inbound_completion_deferred", None)
             except Exception:
                 pass
-            await adapter.handle_message(event)
+            try:
+                await adapter.handle_message(event)
+            except Exception:
+                await self._release_inbound_event_claims(event)
+                logger.exception(
+                    "Startup-restore adapter rejected queued inbound; returned to WAL replay"
+                )
+                continue
             drained += 1
         return drained
 
@@ -9877,6 +10159,191 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "background startup auto-resume task failed after gate release",
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
+
+    async def _redeliver_pending_delivery_components(self) -> int:
+        """Redeliver only unconfirmed pieces of durable multipart plans."""
+        from gateway.delivery_ledger import (
+            delivery_components_by_kind,
+            delivery_plan_complete,
+            mark_delivery_component_delivered,
+            mark_delivery_components_delivered,
+            mark_delivery_component_failed,
+            mark_inbound_turn_completed,
+            RECOVERED_MARKER,
+            sweep_recoverable_delivery_components,
+        )
+
+        platform_names = {
+            str(getattr(platform, "value", platform)) for platform in self.adapters
+        }
+        rows = await asyncio.to_thread(
+            sweep_recoverable_delivery_components, platform_names
+        )
+        recovered = 0
+        touched_turns: set[str] = set()
+        turn_sessions: Dict[str, str] = {}
+        text_components_by_turn: Dict[str, List[str]] = {}
+        for row in rows:
+            if row.get("kind") == "text":
+                text_components_by_turn.setdefault(str(row["turn_id"]), []).append(
+                    str(row["component_id"])
+                )
+        covered_component_ids: set[str] = set()
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        for row in rows:
+            component_id = str(row["component_id"])
+            if component_id in covered_component_ids:
+                continue
+            turn_id = str(row["turn_id"])
+            touched_turns.add(turn_id)
+            turn_sessions[turn_id] = str(row["session_key"])
+            try:
+                platform = Platform(row["platform"])
+            except (TypeError, ValueError):
+                continue
+            adapter = self.adapters.get(platform)
+            if adapter is None:
+                continue
+            payload = row["payload"]
+            durable_metadata = payload.get("routing_metadata")
+            metadata = (
+                dict(durable_metadata)
+                if isinstance(durable_metadata, dict)
+                else (
+                    {"thread_id": str(row["thread_id"])}
+                    if row.get("thread_id")
+                    else {}
+                )
+            )
+            tts_text_siblings: List[Dict[str, str]] = []
+            tts_caption_covers_text = False
+            try:
+                kind = row["kind"]
+                if kind == "text":
+                    content = str(payload.get("content", ""))
+                    if row.get("prior_state") in {"attempting", "failed"}:
+                        content = f"{RECOVERED_MARKER}{content}"
+                    result = await adapter._send_with_retry(
+                        chat_id=str(row["chat_id"]),
+                        content=content,
+                        metadata=metadata,
+                    )
+                    success = bool(getattr(result, "success", False))
+                    error = str(getattr(result, "error", "") or "")
+                elif kind == "image":
+                    result = await adapter._send_image_with_ack(
+                        chat_id=str(row["chat_id"]),
+                        image_url=str(payload.get("url", "")),
+                        alt_text=str(payload.get("alt", "")),
+                        metadata=metadata,
+                    )
+                    success = bool(getattr(result, "success", False))
+                    error = str(getattr(result, "error", "") or "")
+                elif kind == "tts":
+                    tts_text_siblings = await asyncio.to_thread(
+                        delivery_components_by_kind, turn_id, "text"
+                    )
+                    sibling_text_delivered = any(
+                        sibling["state"] == "delivered"
+                        for sibling in tts_text_siblings
+                    )
+                    caption = payload.get("caption")
+                    tts_caption_covers_text = bool(
+                        payload.get("covers_text")
+                        and caption
+                        and not sibling_text_delivered
+                    )
+                    if sibling_text_delivered:
+                        caption = None
+                    result = await adapter.play_tts(
+                        chat_id=str(row["chat_id"]),
+                        audio_path=str(payload.get("path", "")),
+                        caption=caption,
+                        metadata=metadata,
+                    )
+                    success = bool(getattr(result, "success", False))
+                    error = str(getattr(result, "error", "") or "")
+                else:
+                    path = str(payload.get("path", ""))
+                    suffix = Path(path).suffix.lower()
+                    if kind == "media" and payload.get("is_voice"):
+                        result = await adapter.send_voice(
+                            chat_id=str(row["chat_id"]),
+                            audio_path=path,
+                            metadata=metadata,
+                        )
+                    elif suffix in video_exts:
+                        result = await adapter.send_video(
+                            chat_id=str(row["chat_id"]),
+                            video_path=path,
+                            metadata=metadata,
+                        )
+                    elif suffix in image_exts:
+                        result = await adapter.send_image_file(
+                            chat_id=str(row["chat_id"]),
+                            image_path=path,
+                            metadata=metadata,
+                        )
+                    else:
+                        result = await adapter.send_document(
+                            chat_id=str(row["chat_id"]),
+                            file_path=path,
+                            metadata=metadata,
+                        )
+                    success = bool(getattr(result, "success", False))
+                    error = str(getattr(result, "error", "") or "")
+                if success:
+                    covered_ids = (
+                        [
+                            sibling["component_id"]
+                            for sibling in tts_text_siblings
+                            if sibling["state"] != "delivered"
+                        ]
+                        if kind == "tts" and tts_caption_covers_text
+                        else []
+                    )
+                    if covered_ids:
+                        await asyncio.to_thread(
+                            mark_delivery_components_delivered,
+                            [component_id, *covered_ids],
+                        )
+                        covered_component_ids.update(covered_ids)
+                    else:
+                        await asyncio.to_thread(
+                            mark_delivery_component_delivered, component_id
+                        )
+                    recovered += 1
+                else:
+                    await asyncio.to_thread(
+                        mark_delivery_component_failed, component_id, error
+                    )
+            except Exception as exc:
+                await asyncio.to_thread(
+                    mark_delivery_component_failed, component_id, str(exc)
+                )
+                logger.warning(
+                    "multipart delivery recovery failed for %s: %s",
+                    component_id,
+                    exc,
+                )
+
+        for turn_id in touched_turns:
+            if await asyncio.to_thread(delivery_plan_complete, turn_id):
+                session_key = turn_sessions[turn_id]
+                store = getattr(self, "_async_session_store", None)
+                if store is None:
+                    store = getattr(self, "session_store", None)
+                clear_pending = getattr(store, "clear_resume_pending", None)
+                cleared = False
+                if callable(clear_pending):
+                    result = clear_pending(session_key)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    cleared = bool(result)
+                if cleared:
+                    await asyncio.to_thread(mark_inbound_turn_completed, turn_id)
+        return recovered
 
     async def _redeliver_pending_obligations(self) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
@@ -9984,6 +10451,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    def _release_unscheduled_startup_inbound(self, platform=None) -> int:
+        """Return staged WAL rows that no auto-resume task assumed."""
+        from gateway.delivery_ledger import release_inbound_turn_claim
+
+        staged = getattr(self, "_startup_inbound_by_session", {})
+        if not isinstance(staged, dict):
+            return 0
+        platform_name = (
+            str(getattr(platform, "value", platform)) if platform is not None else None
+        )
+        released = 0
+        for session_key, rows in list(staged.items()):
+            scoped_rows = [
+                row
+                for row in rows
+                if platform_name is None or str(row.get("platform")) == platform_name
+            ]
+            if not scoped_rows:
+                continue
+            remaining = [row for row in rows if row not in scoped_rows]
+            if remaining:
+                staged[session_key] = remaining
+            else:
+                staged.pop(session_key, None)
+            for row in scoped_rows:
+                if release_inbound_turn_claim(str(row["turn_id"])):
+                    released += 1
+        return released
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -10021,7 +10517,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
+            self._release_unscheduled_startup_inbound(platform)
             return 0
+
+        from gateway.delivery_ledger import session_has_delivery_plan
+
+        unowned_candidates = []
+        for entry in candidates:
+            if session_has_delivery_plan(entry.session_key):
+                logger.info(
+                    "Skipping agent auto-resume for %s: delivery ledger owns the turn",
+                    entry.session_key,
+                )
+                continue
+            unowned_candidates.append(entry)
+        candidates = unowned_candidates
 
         # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
         # boot when there are restart-interrupted sessions to resume — a clean
@@ -10039,6 +10549,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _max_restarts, _window = self._restart_loop_guard_config()
                 if _rlg.check_and_record(_max_restarts, _window):
+                    self._release_unscheduled_startup_inbound(platform)
                     return 0
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
@@ -10096,14 +10607,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            # Internal recovery event. When an inbound WAL row was claimed for
+            # this session, carry its original request and turn identity into
+            # the reason-aware recovery note instead of relying on the
+            # transcript having flushed before the crash.
+            startup_inbound = getattr(self, "_startup_inbound_by_session", {})
+            inbound_rows = startup_inbound.pop(entry.session_key, [])
+            recovery_texts = [
+                str((row.get("payload") or {}).get("text") or "").strip()
+                for row in inbound_rows
+            ]
+            inbound_turn_ids = [str(row["turn_id"]) for row in inbound_rows]
+            event_metadata: Dict[str, Any] = {}
+            if inbound_rows:
+                event_metadata = {
+                    "_hermes_turn_id": inbound_turn_ids[0],
+                    "_hermes_inbound_turn_ids": inbound_turn_ids,
+                    "_hermes_recovered_inbound": [
+                        row.get("payload") or {} for row in inbound_rows
+                    ],
+                }
             event = MessageEvent(
-                text="",
+                text="\n\n".join(text for text in recovery_texts if text),
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                metadata=event_metadata,
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -10117,6 +10646,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._startup_restore_tasks = tasks
                 tasks.append(task)
             scheduled += 1
+        self._release_unscheduled_startup_inbound(platform)
         if scheduled:
             logger.info(
                 "Scheduled auto-resume for %d restart-interrupted session(s)",
@@ -10972,6 +11502,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        await self._redeliver_pending_delivery_components()
+        await self._recover_inbound_turns()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -11758,13 +12290,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
 
-                        # A platform that was offline at gateway startup never
-                        # got its restart-interrupted sessions auto-resumed —
-                        # the startup pass skips sessions whose adapter isn't
-                        # connected yet. Now that it's back, retry the
-                        # auto-resume scoped to this platform so recovery
-                        # doesn't silently wait for a manual user message.
+                        # A platform that was offline at gateway startup was
+                        # excluded from the durable sweeps. Re-run the startup
+                        # recovery order now that its adapter is deliverable;
+                        # only after WAL and saved output are reconciled may a
+                        # synthetic auto-resume be scheduled.
                         try:
+                            await self._redeliver_pending_obligations()
+                            await self._redeliver_pending_delivery_components()
+                            await self._recover_inbound_turns()
                             self._schedule_resume_pending_sessions(platform=platform)
                         except Exception:
                             logger.debug(
@@ -13488,6 +14022,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 internal=event.internal,
                 timestamp=event.timestamp,
             )
+            queued_turn_id = await self._prepare_inbound_turn(
+                queued_event, quick_key
+            )
+            if queued_turn_id:
+                queued_event.metadata["_hermes_turn_id"] = queued_turn_id
             self._enqueue_fifo(quick_key, queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
@@ -13517,6 +14056,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
+                queued_turn_id = await self._prepare_inbound_turn(
+                    queued_event, quick_key
+                )
+                if queued_turn_id:
+                    queued_event.metadata["_hermes_turn_id"] = queued_turn_id
                 adapter._pending_messages[quick_key] = queued_event
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
@@ -13540,6 +14084,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
+            queued_turn_id = await self._prepare_inbound_turn(
+                queued_event, quick_key
+            )
+            if queued_turn_id:
+                queued_event.metadata["_hermes_turn_id"] = queued_turn_id
             adapter._pending_messages[quick_key] = queued_event
         return "No active agent — /steer queued for the next turn."
 
@@ -15622,6 +16171,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
+        # Topic/pinned-session resolution may have replaced the initial entry.
+        # From this boundary onward all continuity ownership uses the canonical
+        # session key, never the adapter's quick routing key.
+        session_key = session_entry.session_key
+        self._cache_session_source(session_key, source)
+        aliases = getattr(self, "_continuity_session_aliases", None)
+        if aliases is None:
+            aliases = {}
+            self._continuity_session_aliases = aliases
+        aliases[_quick_key] = session_key
+        event.metadata["_hermes_canonical_session_key"] = session_key
+        turn_id = (getattr(event, "metadata", None) or {}).get("_hermes_turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            from gateway.delivery_ledger import rebind_inbound_turn
+
+            await asyncio.to_thread(rebind_inbound_turn, turn_id, session_key)
+
+        # Snapshot inherited recovery state before writing this turn's marker.
+        # The agent bridge receives this immutable value so a normal turn never
+        # mistakes its own write-ahead marker for a previous-process restart.
+        _resume_pending_at_turn_start = bool(
+            getattr(session_entry, "resume_pending", False)
+        )
+
+        # A previous response may have completed while its transport handoff
+        # failed. Its in-memory authorization must not leak into this new turn.
+        ready_handoffs = getattr(self, "_resume_delivery_handoff_ready", None)
+        if ready_handoffs is None:
+            ready_handoffs = {}
+            self._resume_delivery_handoff_ready = ready_handoffs
+        stale_turn_ids = [
+            turn_id
+            for turn_id, ready_session in ready_handoffs.items()
+            if ready_session == session_key
+        ]
+        for stale_turn_id in stale_turn_ids:
+            ready_handoffs.pop(stale_turn_id, None)
+
+        # Write-ahead continuity marker: persist the canonical session before
+        # any session hook or agent/tool work can produce an external effect.
+        # Graceful shutdown also marks active turns, but SIGKILL/power loss
+        # never reaches that path.  The normal successful-turn path clears this
+        # marker; a dead process leaves it behind for startup auto-resume.
+        # Preserve an inherited marker's original reason during recovery.
+        if (
+            not _resume_pending_at_turn_start
+            and not await self.async_session_store.mark_resume_pending(
+                session_key, "turn_in_progress"
+            )
+        ):
+            raise RuntimeError(
+                f"Cannot persist active-turn continuity marker for {session_key}"
+            )
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -16694,6 +17298,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                resume_pending_at_turn_start=_resume_pending_at_turn_start,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -16779,22 +17384,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the call site after the `update_session(...)` write.
 
             # Successful turn — clear any stuck-loop counter for this session.
-            # This ensures the counter only accumulates across CONSECUTIVE
-            # restarts where the session was active (never completed).
-            #
-            # Also clear the resume_pending flag (set by drain-timeout
-            # shutdown) — the turn ran to completion, so recovery
-            # succeeded and subsequent messages should no longer receive
-            # the restart-interruption system note.
+            # The resume marker deliberately stays set until delivery ownership
+            # is durable: the adapter clears after ledger record / transport ACK;
+            # intentional silence and completed streaming clear below.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
@@ -17256,6 +17850,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+                if (
+                    session_key
+                    and _should_clear_resume_pending_after_turn(agent_result)
+                ):
+                    await self.async_session_store.clear_resume_pending(
+                        session_key
+                    )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -17304,8 +17905,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                if (
+                    session_key
+                    and _should_clear_resume_pending_after_turn(agent_result)
+                ):
+                    await self.async_session_store.clear_resume_pending(
+                        session_key
+                    )
                 return None
 
+            if (
+                session_key
+                and _should_clear_resume_pending_after_turn(agent_result)
+            ):
+                turn_id = (getattr(event, "metadata", None) or {}).get(
+                    "_hermes_turn_id"
+                )
+                if isinstance(turn_id, str) and turn_id:
+                    self._resume_delivery_handoff_ready[turn_id] = session_key
             return response
 
         except Exception as e:
@@ -23106,6 +23723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        resume_pending_at_turn_start: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23125,6 +23743,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                resume_pending_at_turn_start=resume_pending_at_turn_start,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23137,6 +23756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                resume_pending_at_turn_start=resume_pending_at_turn_start,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23259,6 +23879,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        resume_pending_at_turn_start: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23543,6 +24164,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            resume_pending_at_turn_start=resume_pending_at_turn_start,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

@@ -71,6 +71,9 @@ def _make_runner():
     runner._honcho_configs = {}
     runner._shutdown_all_gateway_honcho = lambda: None
     runner.session_store = MagicMock()
+    runner._redeliver_pending_obligations = AsyncMock(return_value=0)
+    runner._redeliver_pending_delivery_components = AsyncMock(return_value=0)
+    runner._recover_inbound_turns = AsyncMock(return_value=0)
     return runner
 
 
@@ -227,7 +230,19 @@ class TestPlatformReconnectWatcher:
         """
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
-        runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
+        recovery_order = []
+        runner._redeliver_pending_obligations.side_effect = (
+            lambda: recovery_order.append("obligations") or 0
+        )
+        runner._redeliver_pending_delivery_components.side_effect = (
+            lambda: recovery_order.append("components") or 0
+        )
+        runner._recover_inbound_turns.side_effect = (
+            lambda: recovery_order.append("inbound") or 0
+        )
+        runner._schedule_resume_pending_sessions = MagicMock(
+            side_effect=lambda **kwargs: recovery_order.append("resume") or 1
+        )
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
@@ -258,6 +273,7 @@ class TestPlatformReconnectWatcher:
                 await run_one_iteration()
 
         assert Platform.TELEGRAM in runner.adapters
+        assert recovery_order == ["obligations", "components", "inbound", "resume"]
         runner._schedule_resume_pending_sessions.assert_called_once_with(
             platform=Platform.TELEGRAM
         )
