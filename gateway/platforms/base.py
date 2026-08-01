@@ -6960,11 +6960,17 @@ class BasePlatformAdapter(ABC):
                     logger.debug(
                         "delivery plan completion check failed", exc_info=True
                     )
-            elif processing_ok and delivery_attempted and not _resume_handed_off:
+            elif (
+                processing_ok
+                and delivery_attempted
+                and not _resume_handed_off
+                and isinstance(turn_id, str)
+                and turn_id
+            ):
                 _resume_handed_off = (
                     await self._clear_resume_pending_after_handoff(
                         continuity_session_key,
-                        turn_id if isinstance(turn_id, str) else None,
+                        turn_id,
                     )
                 )
                 processing_ok = _resume_handed_off
