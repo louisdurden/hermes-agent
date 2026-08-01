@@ -17693,7 +17693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         path = _hermes_home / ".telegram_processed_updates.json"
         now = time.time()
         try:
-            data = json.loads(path.read_text()) if path.exists() else {}
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
             data = {}
         entries = data.get("entries", {}) if isinstance(data, dict) else {}
