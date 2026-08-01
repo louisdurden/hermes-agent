@@ -64,6 +64,7 @@ def _make_runner(session_entry: SessionEntry):
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._prepare_inbound_turn = AsyncMock(return_value="queued-turn-id")
     return runner, adapter
 
 
@@ -109,6 +110,8 @@ async def test_queue_preserves_photo_media():
     assert queued.message_type == MessageType.PHOTO
     assert queued.media_urls == ["/tmp/photo-a.jpg"]
     assert queued.media_types == ["image/jpeg"]
+    assert queued.metadata["_hermes_turn_id"] == "queued-turn-id"
+    runner._prepare_inbound_turn.assert_awaited_once_with(queued, sk)
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,7 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _should_inject_resume_pending,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -70,6 +71,52 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+
+
+def test_current_turn_write_ahead_marker_does_not_fake_a_restart():
+    """The marker written by this turn is for the *next process* only.
+
+    A normal inbound message must not receive restart-recovery guidance merely
+    because the write-ahead marker became visible before the agent thread read
+    the session entry.  A marker inherited from the previous process still
+    activates recovery.
+    """
+    entry = MagicMock(resume_pending=True)
+    assert _should_inject_resume_pending(
+        entry, inherited_at_turn_start=False, interruption_is_fresh=True,
+        resume_mark_is_fresh=True,
+    ) is False
+    assert _should_inject_resume_pending(
+        entry, inherited_at_turn_start=True, interruption_is_fresh=True,
+        resume_mark_is_fresh=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_delivery_handoff_requires_and_consumes_success_authorization():
+    runner, _adapter = make_restart_runner()
+    clear_pending = AsyncMock(return_value=True)
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store.clear_resume_pending = clear_pending
+    session_key = "agent:main:telegram:dm:123"
+    turn_a = "turn-a"
+    turn_b = "turn-b"
+
+    assert (
+        await runner._complete_resume_delivery_handoff(session_key, turn_a) is False
+    )
+    clear_pending.assert_not_awaited()
+
+    runner._resume_delivery_handoff_ready[turn_a] = session_key
+    assert (
+        await runner._complete_resume_delivery_handoff(session_key, turn_b) is False
+    )
+    clear_pending.assert_not_awaited()
+
+    assert await runner._complete_resume_delivery_handoff(session_key, turn_a) is True
+    clear_pending.assert_awaited_once_with(session_key)
+    assert turn_a not in runner._resume_delivery_handoff_ready
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
@@ -312,6 +359,15 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+
+    def test_empty_message_interactive_note_continues_without_human_reconstruction(self):
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True
+        )
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
+        assert "inspect current state with read-only tools" in note
+        assert "do not ask the user to reconstruct" in note
 
 
     def test_resume_pending_fires_without_tool_tail(self):
@@ -572,6 +628,155 @@ async def test_drain_timeout_marks_resume_pending():
 
 
 # ---------------------------------------------------------------------------
+# Abrupt-crash active-turn durability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_active_turn_is_marked_durable_before_session_start_hook(tmp_path):
+    """A SIGKILL can arrive before graceful shutdown gets a chance to mark work.
+
+    The active session therefore must be persisted as resume-pending immediately
+    after its canonical session entry is resolved and before any hook or agent
+    work can create an external effect.  A fresh SessionStore proves the marker
+    reached disk rather than merely changing an in-memory object.
+    """
+    from gateway.run import GatewayRunner
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="abrupt-crash-chat")
+    session_key = runner._session_key_for_source(source)
+    runner.session_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = runner.session_store.get_or_create_session(source)
+    assert entry.session_key == session_key
+    runner._resume_delivery_handoff_ready["stale-turn"] = session_key
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._is_telegram_topic_lane = lambda source: False
+    runner.hooks.emit = AsyncMock(side_effect=RuntimeError("stop-after-durable-mark"))
+
+    await GatewayRunner._handle_message_with_agent(
+        runner, MessageEvent(text="continue", message_type=MessageType.TEXT, source=source),
+        source, session_key, 1,
+    )
+
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    recovered = reloaded.get_or_create_session(source)
+    assert recovered.session_key == session_key
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "turn_in_progress"
+    assert "stale-turn" not in runner._resume_delivery_handoff_ready
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resumes_turn_in_progress_after_abrupt_crash():
+    """A fresh process must synthesize exactly one continuation for an active
+    turn marker left behind by an ungraceful process death."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="abrupt-crash-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:abrupt-crash-chat",
+        session_id="sid-abrupt",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_session_owned_by_delivery_plan():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="ledger-owned-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:ledger-owned-chat",
+        session_id="sid-ledger-owned",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch(
+        "gateway.delivery_ledger.session_has_delivery_plan",
+        return_value=True,
+    ):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_historical_plan_does_not_block_new_auto_resume(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="reused-session-chat")
+    session_key = "agent:main:telegram:dm:reused-session-chat"
+    old_turn = "old-completed-turn"
+    dl.record_inbound_turn(
+        turn_id=old_turn,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="reused-session-chat",
+        thread_id=None,
+        payload={"text": "old"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=old_turn,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="reused-session-chat",
+        thread_id=None,
+        components=[{"kind": "text", "payload": {"content": "done"}}],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    dl.mark_inbound_turn_completed(old_turn)
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid-reused",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Gateway startup auto-resume
 # ---------------------------------------------------------------------------
 
@@ -715,6 +920,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert scheduled == 1
     assert seen == ["resume-start"]
     assert runner._startup_restore_queue == [inbound]
+    assert inbound.metadata["_hermes_inbound_completion_deferred"] is True
 
     finish_task = asyncio.create_task(runner._finish_startup_restore())
     await asyncio.sleep(0)
@@ -725,7 +931,87 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
     assert seen == ["resume-start", "inbound:hello"]
     assert runner._startup_restore_queue == []
+    assert "_hermes_inbound_completion_deferred" not in inbound.metadata
     assert runner._startup_restore_in_progress is False
+
+
+def test_stale_resume_candidate_releases_staged_inbound_for_one_replay():
+    from gateway import delivery_ledger as dl
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stale-accepted")
+    session_key = "agent:main:telegram:dm:stale-accepted"
+    entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid-stale",
+        created_at=datetime.now() - timedelta(hours=4),
+        updated_at=datetime.now() - timedelta(hours=4),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now() - timedelta(hours=4),
+    )
+    runner.session_store._entries = {session_key: entry}
+    dl.record_inbound_turn(
+        turn_id="accepted-turn",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="stale-accepted",
+        thread_id=None,
+        payload={"text": "accepted"},
+    )
+    dl.release_inbound_turn_claim("accepted-turn")
+    claimed = dl.sweep_recoverable_inbound_turns()
+    runner._startup_inbound_by_session = {session_key: claimed}
+
+    with patch("gateway.delivery_ledger.session_has_delivery_plan", return_value=False):
+        assert runner._schedule_resume_pending_sessions() == 0
+
+    assert runner._startup_inbound_by_session == {}
+    replay = dl.sweep_recoverable_inbound_turns()
+    duplicate = dl.sweep_recoverable_inbound_turns()
+    assert [row["turn_id"] for row in replay] == ["accepted-turn"]
+    assert duplicate == []
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_missing_adapter_releases_inbound_claim():
+    runner, _adapter = make_restart_runner()
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="missing-adapter"),
+        metadata={"_hermes_turn_id": "turn-missing-adapter"},
+    )
+    runner._startup_restore_queue = [event]
+    runner._adapter_for_source = MagicMock(return_value=None)
+    runner._release_inbound_event_claims = AsyncMock(return_value=1)
+
+    assert await runner._drain_startup_restore_queue() == 0
+    runner._release_inbound_event_claims.assert_awaited_once_with(event)
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
+async def test_startup_resume_adapter_exception_releases_claim_before_acceptance():
+    runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:resume-failure"
+    event = MessageEvent(
+        text="recover",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="resume-failure"),
+        internal=True,
+        metadata={"_hermes_turn_id": "turn-resume-failure"},
+    )
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("adapter rejected"))
+    runner._release_inbound_event_claims = AsyncMock(return_value=1)
+
+    with pytest.raises(RuntimeError, match="adapter rejected"):
+        await runner._run_startup_resume_event(adapter, event, session_key)
+
+    runner._release_inbound_event_claims.assert_awaited_once_with(event)
 
 
 # ---------------------------------------------------------------------------
