@@ -479,7 +479,12 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch(
+            "gateway.run._resolve_gateway_model", return_value="test/model"
+        ), patch(
+            "gateway.platforms.api_server.collect_runtime_readiness",
+            return_value={"status": "ok"},
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -923,6 +928,37 @@ class TestChatCompletionsEndpoint:
                                 assert "ls -la" not in content or content == "Here are the files."
                 # Final content must also be present
                 assert "Here are the files." in body
+
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_buffered_transformed_final_without_deltas(self, adapter):
+        """A required complete-output transform must not make SSE return empty."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**_kwargs):
+                return (
+                    {
+                        "final_response": "withheld by required transform",
+                        "messages": [],
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "clinical"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert body.count("withheld by required transform") == 1
+        assert "[DONE]" in body
 
 
     @pytest.mark.asyncio

@@ -1538,6 +1538,16 @@ class MoAChatCompletions:
         if not pending or "aggregator_input_messages" not in pending:
             return
         try:
+            from hermes_cli.lifecycle import output_transform_requires_buffering
+
+            if output_transform_requires_buffering():
+                return
+        except Exception:
+            # Trace persistence is optional. If the protected-output registry
+            # cannot be inspected, omit the trace rather than persist model
+            # bytes outside the final transform boundary.
+            return
+        try:
             from agent.moa_trace import save_moa_turn
 
             agg_slot = pending.get("aggregator_slot") or {}

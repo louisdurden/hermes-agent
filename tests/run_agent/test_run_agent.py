@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            pass
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3504,6 +3507,39 @@ class TestRunConversation:
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+
+    def test_exhausted_length_continuation_applies_required_transform(self, agent):
+        self._setup_agent(agent)
+        canary = "PROVISIONAL_TRUNCATION_CANARY"
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=canary, finish_reason="length")
+            for _ in range(4)
+        ]
+        persisted = []
+
+        def capture_persist(messages, *_args, **_kwargs):
+            persisted.append(str(messages))
+
+        with (
+            patch(
+                "hermes_cli.lifecycle.output_transform_requires_buffering",
+                return_value=True,
+            ),
+            patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                return_value=["SAFE_TRUNCATION_FINAL"],
+            ),
+            patch.object(agent, "_persist_session", side_effect=capture_persist),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["partial"] is True
+        assert result["final_response"] == "SAFE_TRUNCATION_FINAL"
+        assert result["response_transformed"] is True
+        assert canary not in str(result["messages"])
+        assert canary not in persisted[-1]
+        assert "SAFE_TRUNCATION_FINAL" in persisted[-1]
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""

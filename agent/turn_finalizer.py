@@ -66,6 +66,96 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def apply_output_transform(agent, final_response, messages):
+    """Apply the shared final-output boundary before delivery or persistence."""
+    response_transformed = False
+    captured_output_transform = getattr(agent, "_buffer_model_output", False) is True
+    try:
+        from hermes_cli.lifecycle import output_transform_requires_buffering
+
+        require_output_transform = (
+            captured_output_transform or output_transform_requires_buffering()
+        )
+    except Exception:
+        require_output_transform = True
+    agent._buffer_model_output = require_output_transform
+    if final_response or require_output_transform:
+        original_final_response = final_response
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+
+            transform_results = invoke_hook(
+                "transform_llm_output",
+                response_text=final_response or "",
+                session_id=agent.session_id or "",
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+            if require_output_transform and not transform_results:
+                from hermes_cli.lifecycle import has_hook
+
+                if not has_hook("transform_llm_output"):
+                    raise RuntimeError(
+                        "required output transform registry could not be confirmed"
+                    )
+            for hook_result in transform_results:
+                if isinstance(hook_result, str) and hook_result:
+                    final_response = hook_result
+                    response_transformed = True
+                    break
+            if require_output_transform and not response_transformed:
+                raise RuntimeError(
+                    "required output transform returned no confirmed non-empty output"
+                )
+        except Exception as exc:
+            from agent.conversation_loop import logger
+
+            logger.warning("transform_llm_output hook failed closed: %s", exc)
+            final_response = "A required output transform failed; response withheld."
+            response_transformed = True
+
+        if require_output_transform:
+            for message_idx in range(len(messages) - 1, -1, -1):
+                message = messages[message_idx]
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") == "user":
+                    break
+                if message.get("role") != "assistant":
+                    continue
+                for private_field in (
+                    "reasoning",
+                    "reasoning_content",
+                    "reasoning_details",
+                    "codex_reasoning_items",
+                    "codex_message_items",
+                    "api_content",
+                ):
+                    message.pop(private_field, None)
+                visible = flatten_message_text(message.get("content"))
+                if visible == (original_final_response or ""):
+                    message["content"] = final_response or ""
+                elif message.get("tool_calls"):
+                    message["content"] = ""
+                else:
+                    del messages[message_idx]
+            agent._output_transform_finalized = True
+        elif response_transformed:
+            for message in reversed(messages):
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") == "user":
+                    break
+                if (
+                    message.get("role") == "assistant"
+                    and flatten_message_text(message.get("content"))
+                    == (original_final_response or "")
+                ):
+                    message["content"] = final_response
+                    break
+    return final_response, response_transformed, require_output_transform
+
+
 def finalize_turn(
     agent,
     *,
@@ -200,6 +290,15 @@ def finalize_turn(
             or normal_text_response
         )
     )
+
+    # Transform model output before any transcript persistence or external
+    # delivery. This applies to interrupted partial responses too: a partial
+    # fragment is still model output and must not bypass a required guard.
+    (
+        final_response,
+        _response_transformed,
+        _require_output_transform,
+    ) = apply_output_transform(agent, final_response, messages)
 
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
@@ -389,6 +488,8 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
+        if _require_output_transform:
+            agent._output_transform_finalized = True
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -453,7 +554,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _require_output_transform:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -479,7 +580,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not _require_output_transform:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -519,30 +620,6 @@ def finalize_turn(
                             )
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
-
-    _response_transformed = False
-
-    # Plugin hook: transform_llm_output
-    # Fired once per turn after the tool-calling loop completes.
-    # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _transform_results = _invoke_hook(
-                "transform_llm_output",
-                response_text=final_response,
-                session_id=agent.session_id or "",
-                model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
-            )
-            for _hook_result in _transform_results:
-                if isinstance(_hook_result, str) and _hook_result:
-                    final_response = _hook_result
-                    _response_transformed = True
-                    break  # First non-empty string wins
-        except Exception as exc:
-            logger.warning("transform_llm_output hook failed: %s", exc)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -603,12 +680,13 @@ def finalize_turn(
     # with reasoning=None, so picking only the last assistant would
     # silently drop legitimate same-turn reasoning.
     last_reasoning = None
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            break  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+    if not _require_output_transform:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                break  # turn boundary — don't cross into prior turns
+            if msg.get("role") == "assistant" and msg.get("reasoning"):
+                last_reasoning = msg["reasoning"]
+                break
 
     # Build result with interrupt info if applicable
     result = {
@@ -669,6 +747,7 @@ def finalize_turn(
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
+    agent._buffer_model_output = False
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False

@@ -31,6 +31,205 @@ def _contents(db, session_id=SESSION_ID):
 
 
 class TestIdentityFlush:
+    def test_required_transform_round_trip_reloads_only_safe_assistant_output(
+        self, monkeypatch
+    ):
+        """Incremental + final persistence reloads structure and transformed prose only."""
+        import json
+
+        from agent.turn_finalizer import finalize_turn
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_path = root / "t.db"
+            db = SessionDB(db_path=db_path)
+            try:
+                agent = _make_agent(db)
+                agent._buffer_model_output = True
+                agent._output_transform_finalized = False
+                agent._session_json_enabled = True
+                agent.logs_dir = root
+                agent._save_trajectory = lambda *_args, **_kwargs: None
+                agent._cleanup_task_resources = lambda *_args, **_kwargs: None
+                messages = [
+                    {"role": "user", "content": "clinical question"},
+                    {
+                        "role": "assistant",
+                        "content": "unsafe interim",
+                        "reasoning": "unsafe reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": "lookup",
+                        "content": "retrieved evidence",
+                    },
+                    {"role": "assistant", "content": "unsafe final"},
+                ]
+                agent._persist_session(messages, [])
+                monkeypatch.setattr(
+                    "hermes_cli.lifecycle.output_transform_requires_buffering",
+                    lambda: True,
+                )
+                monkeypatch.setattr(
+                    "hermes_cli.lifecycle.invoke_hook",
+                    lambda hook_name, **_kwargs: (
+                        ["safe transformed"]
+                        if hook_name == "transform_llm_output"
+                        else []
+                    ),
+                )
+
+                result = finalize_turn(
+                    agent,
+                    final_response="unsafe final",
+                    api_call_count=1,
+                    interrupted=False,
+                    failed=False,
+                    messages=messages,
+                    conversation_history=[],
+                    effective_task_id="task",
+                    turn_id="turn",
+                    user_message="clinical question",
+                    original_user_message="clinical question",
+                    _should_review_memory=False,
+                    _turn_exit_reason="text_response(end_turn)",
+                )
+
+                assert result["final_response"] == "safe transformed"
+            finally:
+                db.close()
+
+            reopened = SessionDB(db_path=db_path)
+            try:
+                rows = reopened.get_messages(SESSION_ID)
+                serialized = repr(rows)
+                assert "unsafe interim" not in serialized
+                assert "unsafe reasoning" not in serialized
+                assert "unsafe final" not in serialized
+                assert [
+                    row["content"] for row in rows if row["role"] == "assistant"
+                ] == [None, "safe transformed"]
+            finally:
+                reopened.close()
+
+            snapshot = json.loads((root / f"session_{SESSION_ID}.json").read_text())
+            serialized_snapshot = repr(snapshot)
+            assert "unsafe interim" not in serialized_snapshot
+            assert "unsafe reasoning" not in serialized_snapshot
+            assert "unsafe final" not in serialized_snapshot
+            assert "safe transformed" in serialized_snapshot
+
+    def test_required_output_transform_withholds_provisional_json_snapshot_bytes(self):
+        """Optional JSON snapshots obey the same pre-transform persistence barrier."""
+        import json
+
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = SessionDB(db_path=root / "t.db")
+            try:
+                agent = _make_agent(db)
+                agent._buffer_model_output = True
+                agent._output_transform_finalized = False
+                agent._session_json_enabled = True
+                agent.logs_dir = root
+                messages = [
+                    {"role": "user", "content": "clinical question"},
+                    {
+                        "role": "assistant",
+                        "content": "unsafe snapshot prose",
+                        "reasoning": "unsafe snapshot reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": "lookup",
+                        "content": "retrieved evidence",
+                    },
+                    {"role": "assistant", "content": "unsafe snapshot final"},
+                ]
+
+                agent._persist_session(messages, [])
+
+                snapshot = json.loads((root / f"session_{SESSION_ID}.json").read_text())
+                serialized = repr(snapshot)
+                assert "unsafe snapshot prose" not in serialized
+                assert "unsafe snapshot reasoning" not in serialized
+                assert "unsafe snapshot final" not in serialized
+                assistant_rows = [
+                    row for row in snapshot["messages"] if row["role"] == "assistant"
+                ]
+                assert len(assistant_rows) == 1
+                assert assistant_rows[0]["content"] in (None, "")
+                assert assistant_rows[0]["tool_calls"]
+            finally:
+                db.close()
+
+    def test_required_output_transform_withholds_provisional_assistant_bytes(self):
+        """Buffered turns persist tool structure, never provisional model prose."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                agent._buffer_model_output = True
+                agent._output_transform_finalized = False
+                messages = [
+                    {"role": "user", "content": "clinical question"},
+                    {
+                        "role": "assistant",
+                        "content": "unsafe interim",
+                        "reasoning": "unsafe reasoning",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": "lookup",
+                        "content": "retrieved evidence",
+                    },
+                    {"role": "assistant", "content": "unsafe final candidate"},
+                ]
+
+                agent._flush_messages_to_session_db(messages, [])
+
+                rows = db.get_messages(SESSION_ID)
+                serialized = repr(rows)
+                assert "unsafe interim" not in serialized
+                assert "unsafe reasoning" not in serialized
+                assert "unsafe final candidate" not in serialized
+                assistant_rows = [row for row in rows if row["role"] == "assistant"]
+                assert len(assistant_rows) == 1
+                assert assistant_rows[0]["content"] in (None, "")
+                assert assistant_rows[0]["tool_calls"]
+                assert any(row["role"] == "tool" for row in rows)
+            finally:
+                db.close()
+
     def test_repair_shrunk_messages_below_history_length_still_persists_assistant(self):
         """When repair shortens messages below conversation_history, don't slice empty."""
         from hermes_state import SessionDB
@@ -197,3 +396,30 @@ class TestIdentityFlush:
                 assert new_assistant.get("_db_persisted") is True
             finally:
                 db.close()
+
+
+def test_shutdown_memory_provider_withholds_unfinalized_assistant_bytes():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = MagicMock()
+    agent.context_compressor = MagicMock()
+    agent.session_id = "shutdown-protected"
+    agent._buffer_model_output = True
+    agent._output_transform_finalized = False
+    history = [
+        {"role": "user", "content": "prior user"},
+        {"role": "assistant", "content": "safe prior assistant"},
+        {"role": "user", "content": "current user"},
+        {"role": "assistant", "content": "PROVISIONAL_SHUTDOWN_CANARY"},
+    ]
+
+    agent.shutdown_memory_provider(history)
+
+    manager_history = agent._memory_manager.on_session_end.call_args.args[0]
+    context_history = agent.context_compressor.on_session_end.call_args.args[1]
+    assert "safe prior assistant" in str(manager_history)
+    assert "PROVISIONAL_SHUTDOWN_CANARY" not in str(manager_history)
+    assert "PROVISIONAL_SHUTDOWN_CANARY" not in str(context_history)

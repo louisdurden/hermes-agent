@@ -214,6 +214,8 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_blocked",
 }
 
+_HOOK_ERROR_UNSET = object()
+
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
@@ -1174,11 +1176,21 @@ class PluginContext:
             display_name,
         )
 
-    def register_hook(self, hook_name: str, callback: Callable) -> None:
+    def register_hook(
+        self,
+        hook_name: str,
+        callback: Callable,
+        *,
+        on_error: Any = _HOOK_ERROR_UNSET,
+    ) -> None:
         """Register a lifecycle hook callback.
 
         Unknown hook names produce a warning but are still stored so
         forward-compatible plugins don't break.
+
+        ``on_error`` is an opt-in fail-closed fallback. When supplied, the
+        value is returned in place of this callback if it raises. Existing
+        hooks retain the legacy isolated/fail-open behavior by default.
         """
         if hook_name not in VALID_HOOKS:
             logger.warning(
@@ -1189,6 +1201,10 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         self._manager._hooks.setdefault(hook_name, []).append(callback)
+        if on_error is not _HOOK_ERROR_UNSET:
+            self._manager._hook_error_fallbacks.setdefault(hook_name, {})[
+                callback
+            ] = on_error
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1270,6 +1286,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_error_fallbacks: Dict[str, Dict[Callable, Any]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -1311,6 +1328,7 @@ class PluginManager:
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_error_fallbacks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -1930,6 +1948,7 @@ class PluginManager:
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
+        error_fallbacks = self._hook_error_fallbacks.get(hook_name, {})
         results: List[Any] = []
         for cb in callbacks:
             try:
@@ -1943,6 +1962,20 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+                if cb in error_fallbacks:
+                    fallback = error_fallbacks[cb]
+                    if fallback is not None:
+                        results.append(fallback)
+                    elif hook_name == "transform_llm_output":
+                        # ``None`` cannot stand in for a safe complete output.
+                        # Treat it like an absent fallback at this delivery
+                        # boundary and let the finalizer withhold the response.
+                        raise
+                elif hook_name == "transform_llm_output":
+                    # Complete-output transforms are delivery boundaries.
+                    # Swallowing an exception here would release the original
+                    # text after callers intentionally buffered every delta.
+                    raise
         return results
 
     def has_hook(self, hook_name: str) -> bool:

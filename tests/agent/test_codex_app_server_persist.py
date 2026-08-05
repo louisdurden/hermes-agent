@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -76,6 +76,45 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_required_transform_precedes_persistence_memory_and_return():
+    agent = _make_agent(session_db=object())
+    agent._buffer_model_output = True
+    agent.model = "codex"
+    agent.platform = "telegram"
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    agent._sync_external_memory_for_turn = MagicMock()
+    messages = [{"role": "user", "content": "hello"}]
+
+    with (
+        patch(
+            "hermes_cli.lifecycle.output_transform_requires_buffering",
+            return_value=True,
+        ),
+        patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            return_value=["SAFE_TRANSFORMED_FINAL"],
+        ),
+    ):
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+    assert result["final_response"] == "SAFE_TRANSFORMED_FINAL"
+    assert "CODEX_ASSISTANT" not in str(messages)
+    assert messages[-1]["content"] == "SAFE_TRANSFORMED_FINAL"
+    flushed = agent._flush_messages_to_session_db.call_args.args[0]
+    assert "CODEX_ASSISTANT" not in str(flushed)
+    assert "SAFE_TRANSFORMED_FINAL" in str(flushed)
+    assert (
+        agent._sync_external_memory_for_turn.call_args.kwargs["final_response"]
+        == "SAFE_TRANSFORMED_FINAL"
+    )
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
@@ -110,6 +149,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -158,6 +198,8 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        if db is not None:
+            db.close()
         shutil.rmtree(tmp)
 
 

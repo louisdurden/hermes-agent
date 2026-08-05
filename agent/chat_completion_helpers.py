@@ -1407,10 +1407,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             combined = "\n\n".join(b.strip() for b in think_blocks if b.strip())
             reasoning_text = combined or None
 
-    if reasoning_text and agent.verbose_logging:
+    buffer_model_output = bool(getattr(agent, "_buffer_model_output", False))
+
+    if reasoning_text and agent.verbose_logging and not buffer_model_output:
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
-    if reasoning_text and agent.reasoning_callback:
+    if reasoning_text and agent.reasoning_callback and not buffer_model_output:
         # Skip callback when streaming is active — reasoning was already
         # displayed during the stream via one of two paths:
         #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
@@ -3231,7 +3233,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif (
+                    agent.stream_delta_callback
+                    and not getattr(agent, "_buffer_model_output", False)
+                ):
                     try:
                         agent.stream_delta_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)

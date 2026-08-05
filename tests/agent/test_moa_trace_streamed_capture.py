@@ -85,6 +85,9 @@ def _read_single_trace(trace_dir, session_id):
 def test_streamed_without_fallback_points_to_session_db(tmp_path, monkeypatch):
     """Streaming turn with no resolvable text falls back to the state.db pointer."""
     trace_dir = _enable_traces(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: False
+    )
     mc = _make_completions_with_pending(streamed=True, inline_output=None)
 
     mc.consume_and_save_trace("sess_nofb", aggregator_output_fallback=None)
@@ -96,9 +99,25 @@ def test_streamed_without_fallback_points_to_session_db(tmp_path, monkeypatch):
     assert agg["output_location"] == "assistant_message_in_session_db"
 
 
+def test_required_transform_withholds_aggregator_output_from_trace(tmp_path, monkeypatch):
+    trace_dir = _enable_traces(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: True
+    )
+    canary = "PROVISIONAL_OUTPUT_CANARY_MOA_TRACE"
+    mc = _make_completions_with_pending(streamed=False, inline_output=canary)
+
+    mc.consume_and_save_trace("sess_protected", aggregator_output_fallback=canary)
+
+    assert not (trace_dir / "sess_protected.jsonl").exists()
+
+
 def test_pending_trace_cleared_after_flush(tmp_path, monkeypatch):
     """A second flush is a no-op (pending cleared) — never double-writes."""
     trace_dir = _enable_traces(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: False
+    )
     mc = _make_completions_with_pending(streamed=True, inline_output=None)
 
     mc.consume_and_save_trace("sess_once", aggregator_output_fallback="x")

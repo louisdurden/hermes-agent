@@ -37,6 +37,18 @@ def has_hook(hook_name: str) -> bool:
     return plugins.has_hook(hook_name)
 
 
+def output_transform_requires_buffering() -> bool:
+    """Fail closed when any plugin must inspect complete model output."""
+    try:
+        return has_hook("transform_llm_output")
+    except Exception:
+        logger.error(
+            "Unable to inspect transform_llm_output hooks; forcing buffering",
+            exc_info=True,
+        )
+        return True
+
+
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
     try:

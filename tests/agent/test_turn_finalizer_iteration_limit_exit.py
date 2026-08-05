@@ -128,6 +128,238 @@ def _finalize(
 
 
 
+def test_transform_dispatch_failure_is_fail_closed_and_persisted_safe(monkeypatch):
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("dispatcher unavailable")
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _raise)
+    agent = _LimitAgent()
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "unsafe original response"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="unsafe original response",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(end_turn)",
+    )
+
+    assert result["response_transformed"] is True
+    assert result["final_response"] == (
+        "A required output transform failed; response withheld."
+    )
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+def test_unconfirmed_required_transform_with_empty_results_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: True
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda *_a, **_kw: False)
+    agent = _LimitAgent()
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "unsafe original response"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="unsafe original response",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(end_turn)",
+    )
+
+    assert result["final_response"] == (
+        "A required output transform failed; response withheld."
+    )
+    assert result["response_transformed"] is True
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+@pytest.mark.parametrize("transform_result", [None, ""])
+def test_confirmed_required_transform_without_nonempty_value_is_fail_closed(
+    monkeypatch, transform_result
+):
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [transform_result]
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda *_a, **_kw: True)
+    agent = _LimitAgent()
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "PROVISIONAL_OUTPUT_CANARY"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="PROVISIONAL_OUTPUT_CANARY",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(end_turn)",
+    )
+
+    assert result["final_response"] == (
+        "A required output transform failed; response withheld."
+    )
+    assert result["response_transformed"] is True
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+def test_interrupted_partial_response_is_transformed_before_persistence(monkeypatch):
+    safe = "withheld by required transform"
+
+    def _invoke(hook_name, **_kwargs):
+        return [safe] if hook_name == "transform_llm_output" else []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _invoke)
+    agent = _LimitAgent()
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "unsafe partial response"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="unsafe partial response",
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted_by_user",
+    )
+
+    assert result["final_response"] == safe
+    assert result["response_transformed"] is True
+    assert agent.persisted_messages[-1]["content"] == safe
+
+
+def test_required_transform_sanitizes_interims_reasoning_and_post_transform_explainer(
+    monkeypatch,
+):
+    safe = "withheld"
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **_kwargs: [safe] if hook_name == "transform_llm_output" else [],
+    )
+    agent = _LimitAgent(completion_explainer=True)
+    messages = [
+        {"role": "user", "content": "clinical task"},
+        {
+            "role": "assistant",
+            "content": "unsafe interim",
+            "reasoning": "unsafe clinical reasoning",
+        },
+        {"role": "assistant", "content": "unsafe final"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="unsafe final",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="clinical task",
+        original_user_message="clinical task",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assistants = [
+        message for message in agent.persisted_messages
+        if message.get("role") == "assistant"
+    ]
+    assert result["final_response"] == safe
+    assert result["last_reasoning"] is None
+    assert "iteration-limit explanation" not in result["final_response"]
+    assert all(not message.get("reasoning") for message in assistants)
+    assert all("_db_persisted" not in message for message in assistants)
+    assert [message.get("content") for message in assistants] == [safe]
+    assert agent._output_transform_finalized is True
+
+
+def test_captured_required_transform_is_monotonic_when_registry_changes(monkeypatch):
+    safe = "withheld"
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.output_transform_requires_buffering", lambda: False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda hook_name, **_kwargs: [safe] if hook_name == "transform_llm_output" else [],
+    )
+    agent = _LimitAgent()
+    agent._buffer_model_output = True
+    messages = [
+        {"role": "user", "content": "clinical task"},
+        {"role": "assistant", "content": "unsafe final"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="unsafe final",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="clinical task",
+        original_user_message="clinical task",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(end_turn)",
+    )
+
+    assert result["final_response"] == safe
+    assert result["response_transformed"] is True
+    assert agent._buffer_model_output is False
+    assert agent._output_transform_finalized is True
+
+
 @pytest.mark.parametrize(
     ("exit_reason", "interrupted", "failed"),
     [

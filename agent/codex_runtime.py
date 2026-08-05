@@ -764,8 +764,15 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    safe_final_text = turn.final_text
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
+
+        from agent.turn_finalizer import apply_output_transform
+
+        safe_final_text, _, _ = apply_output_transform(
+            agent, safe_final_text, messages
+        )
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
@@ -803,6 +810,13 @@ def run_codex_app_server_turn(
                     getattr(agent, "session_id", None),
                 )
 
+    else:
+        from agent.turn_finalizer import apply_output_transform
+
+        safe_final_text, _, _ = apply_output_transform(
+            agent, safe_final_text, messages
+        )
+
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -835,7 +849,7 @@ def run_codex_app_server_turn(
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
-                final_response=turn.final_text,
+                final_response=safe_final_text,
                 interrupted=False,
                 messages=messages,
             )
@@ -846,7 +860,7 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
+        safe_final_text
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):
@@ -860,7 +874,7 @@ def run_codex_app_server_turn(
             logger.debug("background review spawn raised", exc_info=True)
 
     return {
-        "final_response": turn.final_text,
+        "final_response": safe_final_text,
         "messages": messages,
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,

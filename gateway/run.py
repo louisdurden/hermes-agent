@@ -2247,6 +2247,37 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _model_output_delivery_flags(
+    *,
+    streaming_enabled: bool,
+    interim_enabled: bool,
+    transform_required: bool,
+) -> tuple[bool, bool, bool]:
+    """Resolve text deltas, interim previews, and streaming-TTS delivery."""
+    if transform_required:
+        return False, False, False
+    return streaming_enabled, interim_enabled, True
+
+
+def _output_transform_requires_buffering() -> bool:
+    """Buffer model prose whenever a plugin must transform the final output.
+
+    Streaming, interim previews, and streaming TTS are externally visible
+    delivery paths. They must not receive untransformed text. Introspection
+    failures also buffer, preserving a safe first-write ordering.
+    """
+    try:
+        from hermes_cli.lifecycle import has_hook
+
+        return bool(has_hook("transform_llm_output"))
+    except Exception as exc:
+        logger.warning(
+            "Could not inspect transform_llm_output hooks; buffering output: %s",
+            exc,
+        )
+        return True
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -4165,8 +4196,18 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _buffer_model_output = _output_transform_requires_buffering()
+        (
+            _want_stream_deltas,
+            _want_interim_messages,
+            _allow_streaming_tts,
+        ) = _model_output_delivery_flags(
+            streaming_enabled=_streaming_enabled,
+            interim_enabled=ctx.interim_assistant_messages_enabled,
+            transform_required=_buffer_model_output,
+        )
+        if not _allow_streaming_tts:
+            _stts_consumer_ref = None
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -9118,9 +9159,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             len(_session_messages),
                         )
                         from gateway.shutdown_flush import flush_agent_history_to_file
+                        include_assistant = not (
+                            bool(getattr(agent, "_buffer_model_output", False))
+                            and not bool(getattr(agent, "_output_transform_finalized", False))
+                        )
                         flush_agent_history_to_file(
                             getattr(agent, "session_id", None),
                             _session_messages,
+                            include_assistant=include_assistant,
                         )
             except Exception as _e:
                 logger.debug("Shutdown transcript flush failed: %s", _e)

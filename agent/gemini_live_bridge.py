@@ -558,6 +558,15 @@ class GeminiLiveSession:
                                 f"(SOUL.md: 'resuelve y se retira'): {turn_transcript!r}",
                                 flush=True,
                             )
+                            # Gemini puede empaquetar la transcripción que activa el
+                            # filtro junto con el audio sustantivo del mismo turno. Si
+                            # descartamos ese frame, el Desktop recibe únicamente el
+                            # turnComplete sintético y la respuesta queda totalmente
+                            # muda. Conservamos ese audio ya generado y cortamos solo
+                            # los frames posteriores del turno.
+                            model_parts = server_content.get("modelTurn", {}).get("parts", [])
+                            if any(part.get("inlineData", {}).get("data") for part in model_parts):
+                                await client_ws.send_text(text)
                             await client_ws.send_text(json.dumps({"serverContent": {"turnComplete": True}}))
                         elif not turn_muted:
                             await client_ws.send_text(text)

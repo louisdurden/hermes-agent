@@ -1842,7 +1842,31 @@ class AIAgent:
         def _persist_and_drain() -> None:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._save_session_log(messages)
+            _snapshot_messages = messages
+            if (
+                getattr(self, "_buffer_model_output", False) is True
+                and getattr(self, "_output_transform_finalized", False) is not True
+            ):
+                _snapshot_messages = []
+                for _message in messages:
+                    if not isinstance(_message, dict) or _message.get("role") != "assistant":
+                        _snapshot_messages.append(_message)
+                        continue
+                    if not _message.get("tool_calls"):
+                        continue
+                    _safe_assistant = dict(_message)
+                    _safe_assistant["content"] = None
+                    _safe_assistant.pop("api_content", None)
+                    for _private_field in (
+                        "reasoning",
+                        "reasoning_content",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    ):
+                        _safe_assistant.pop(_private_field, None)
+                    _snapshot_messages.append(_safe_assistant)
+            self._save_session_log(_snapshot_messages)
             self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
@@ -2032,6 +2056,12 @@ class AIAgent:
                 ):
                     _scan_start += 1
 
+            _protected_output_pending = (
+                getattr(self, "_buffer_model_output", False) is True
+                and getattr(self, "_output_transform_finalized", False) is not True
+            )
+            _first_deferred_idx = None
+
             for _msg_idx in range(_scan_start, len(messages)):
                 msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
@@ -2057,12 +2087,24 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                tool_calls_data = None
+                if isinstance(msg.get("tool_calls"), list):
+                    tool_calls_data = msg["tool_calls"]
+                _protected_assistant = _protected_output_pending and role == "assistant"
+                if _protected_assistant and not tool_calls_data:
+                    if _first_deferred_idx is None:
+                        _first_deferred_idx = _msg_idx
+                    continue
+                if _protected_assistant:
+                    content = None
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
                 # so replay can reproduce the sent prefix byte-for-byte.
                 _row_api_content = msg.get("api_content")
                 if not isinstance(_row_api_content, str):
+                    _row_api_content = None
+                if _protected_assistant:
                     _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
@@ -2142,14 +2184,6 @@ class AIAgent:
                         elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
                             _txt.append("[screenshot]")
                     content = "\n".join(_txt) if _txt else None
-                tool_calls_data = None
-                if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
-                    tool_calls_data = [
-                        {"name": tc.function.name, "arguments": tc.function.arguments}
-                        for tc in msg.tool_calls
-                    ]
-                elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -2158,11 +2192,11 @@ class AIAgent:
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
                     finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning") if role == "assistant" else None,
-                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
-                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
-                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
-                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    reasoning=msg.get("reasoning") if role == "assistant" and not _protected_assistant else None,
+                    reasoning_content=msg.get("reasoning_content") if role == "assistant" and not _protected_assistant else None,
+                    reasoning_details=msg.get("reasoning_details") if role == "assistant" and not _protected_assistant else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" and not _protected_assistant else None,
+                    codex_message_items=msg.get("codex_message_items") if role == "assistant" and not _protected_assistant else None,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -2184,7 +2218,11 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
             # Snapshot for the bounded scan above — only on full success, so
             # a partially-processed list can never be treated as settled.
-            self._db_flush_scan_prefix = messages[:]
+            self._db_flush_scan_prefix = (
+                messages[:_first_deferred_idx]
+                if _first_deferred_idx is not None
+                else messages[:]
+            )
             return True
         except Exception as e:
             # Force a full re-scan on the next flush: an exception mid-loop
@@ -3783,6 +3821,31 @@ class AIAgent:
             "budget_max": self.iteration_budget.max_total,
         }
 
+    def _safe_session_boundary_messages(self, messages: list | None) -> list:
+        history = list(messages or [])
+        if not (
+            getattr(self, "_buffer_model_output", False) is True
+            and getattr(self, "_output_transform_finalized", False) is not True
+        ):
+            return history
+        last_user_index = max(
+            (
+                index
+                for index, message in enumerate(history)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            default=-1,
+        )
+        return [
+            message
+            for index, message in enumerate(history)
+            if not (
+                index > last_user_index
+                and isinstance(message, dict)
+                and message.get("role") == "assistant"
+            )
+        ]
+
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
 
@@ -3791,9 +3854,10 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        safe_messages = self._safe_session_boundary_messages(messages)
         if self._memory_manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(safe_messages)
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
@@ -3805,7 +3869,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    safe_messages,
                 )
             except Exception:
                 pass
@@ -3815,9 +3879,10 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
+        safe_messages = self._safe_session_boundary_messages(messages)
         if self._memory_manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(safe_messages)
             except Exception:
                 pass
         # Notify context engine of session end too — same lifecycle moment as
@@ -3830,7 +3895,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    safe_messages,
                 )
             except Exception:
                 pass
@@ -5469,6 +5534,7 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        buffer_model_output = bool(getattr(self, "_buffer_model_output", False))
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -5484,7 +5550,7 @@ class AIAgent:
                 ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
                 if ctx_scrubber is not None:
                     think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
+                if think_tail and not buffer_model_output:
                     callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
                     for cb in callbacks:
                         try:
@@ -5498,7 +5564,7 @@ class AIAgent:
         scrubber = getattr(self, "_stream_context_scrubber", None)
         if scrubber is not None:
             tail = scrubber.flush()
-            if tail:
+            if tail and not buffer_model_output:
                 callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
                 for cb in callbacks:
                     try:
@@ -5636,6 +5702,8 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
+        if getattr(self, "_buffer_model_output", False):
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
             return
@@ -5663,6 +5731,8 @@ class AIAgent:
         when the only streamed text was unrelated mid-turn commentary. (#65919
         review: response-loss blocker)
         """
+        if getattr(self, "_buffer_model_output", False):
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
@@ -5778,6 +5848,8 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if getattr(self, "_buffer_model_output", False):
+            return
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -5836,6 +5908,8 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if getattr(self, "_buffer_model_output", False):
+            return
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():

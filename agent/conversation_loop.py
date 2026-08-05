@@ -2964,6 +2964,19 @@ def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
+                            del messages[current_turn_user_idx + 1 :]
+                            messages.append(
+                                {"role": "assistant", "content": partial_response}
+                            )
+                            from agent.turn_finalizer import apply_output_transform
+
+                            (
+                                partial_response,
+                                response_transformed,
+                                _,
+                            ) = apply_output_transform(
+                                agent, partial_response or None, messages
+                            )
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
@@ -2972,6 +2985,7 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
+                                "response_transformed": response_transformed,
                                 "error": "Response remained truncated after 4 continuation attempts",
                             }
 
@@ -6095,7 +6109,10 @@ def run_conversation(
                 # flushing here prevents it from wrapping tool feed lines.
                 # Only signal the display callback — TTS (_stream_callback)
                 # should NOT receive None (it uses None as end-of-stream).
-                if agent.stream_delta_callback:
+                if (
+                    agent.stream_delta_callback
+                    and not getattr(agent, "_buffer_model_output", False)
+                ):
                     try:
                         agent.stream_delta_callback(None)
                     except Exception:
@@ -6126,8 +6143,12 @@ def run_conversation(
                     # but the callback is still alive — fire the text
                     # through it so SSE/TUI clients see the explanation.
                     if final_response:
-                        agent._safe_print(f"\n{final_response}\n")
-                        if agent.stream_delta_callback:
+                        if not getattr(agent, "_buffer_model_output", False):
+                            agent._safe_print(f"\n{final_response}\n")
+                        if (
+                            agent.stream_delta_callback
+                            and not getattr(agent, "_buffer_model_output", False)
+                        ):
                             try:
                                 agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)

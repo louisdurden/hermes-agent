@@ -477,6 +477,22 @@ class TestInlineThinkBlockExtraction(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertIn("Deep analysis", captured[0])
 
+    def test_required_output_transform_suppresses_reasoning_callback_and_log(self):
+        agent = self._make_agent()
+        captured = []
+        agent._buffer_model_output = True
+        agent.verbose_logging = True
+        agent.reasoning_callback = lambda text: captured.append(text)
+        api_msg = self._build_msg(
+            "<think>PROVISIONAL_REASONING</think>Provisional answer."
+        )
+
+        with patch("agent.chat_completion_helpers.logging.debug") as debug:
+            agent._build_assistant_message(api_msg, "stop")
+
+        self.assertEqual(captured, [])
+        debug.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Config defaults

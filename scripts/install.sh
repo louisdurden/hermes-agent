@@ -1367,6 +1367,49 @@ EOF
     log_success "Repository ready"
 }
 
+# --- venv rollback guard (local hardening, FX-Hermes-venv-rollback) ---
+# setup_venv() used to `rm -rf venv` before python-deps had proven it could
+# actually rebuild it. Those two stages run as SEPARATE processes, so a
+# transient python-deps failure (observed 2026-08-04: a ~2 min PyPI network
+# blip -> "tcp connect error / Bad file descriptor") left the user with a
+# destroyed venv and a Hermes that could not start at all. The old venv is now
+# moved aside and rolled back automatically if python-deps fails, so a
+# transient outage degrades to "no upgrade" instead of "app is bricked".
+VENV_SNAPSHOT_DIR="venv.prev"
+
+venv_snapshot_take() {
+    [ -d "$INSTALL_DIR/venv" ] || return 0
+    rm -rf "$INSTALL_DIR/$VENV_SNAPSHOT_DIR"
+    mv "$INSTALL_DIR/venv" "$INSTALL_DIR/$VENV_SNAPSHOT_DIR" 2>/dev/null || {
+        # Fall back to the old destructive behaviour rather than blocking install.
+        rm -rf "$INSTALL_DIR/venv"
+        return 0
+    }
+    log_info "Previous virtual environment kept as $VENV_SNAPSHOT_DIR until dependencies install cleanly"
+}
+
+venv_snapshot_discard() {
+    rm -rf "$INSTALL_DIR/$VENV_SNAPSHOT_DIR" 2>/dev/null
+    return 0
+}
+
+# Installed as an EXIT trap by install_deps: restores the snapshot on any
+# non-zero exit (explicit `exit 1`, unexpected error, or interrupt).
+venv_snapshot_restore_on_failure() {
+    _venv_rb_rc=$?
+    if [ "$_venv_rb_rc" -ne 0 ] && [ -d "$INSTALL_DIR/$VENV_SNAPSHOT_DIR" ]; then
+        log_warn "Dependency install failed — restoring the previous virtual environment..."
+        rm -rf "$INSTALL_DIR/venv"
+        if mv "$INSTALL_DIR/$VENV_SNAPSHOT_DIR" "$INSTALL_DIR/venv" 2>/dev/null; then
+            log_warn "Previous venv restored. Hermes should still start with its prior dependencies."
+            log_info "This was most likely a transient network failure — re-run the install to retry."
+        else
+            log_error "Could not restore the previous venv from $VENV_SNAPSHOT_DIR (restore it manually)."
+        fi
+    fi
+    return "$_venv_rb_rc"
+}
+
 setup_venv() {
     if [ "$USE_VENV" = false ]; then
         log_info "Skipping virtual environment (--no-venv)"
@@ -1378,7 +1421,7 @@ setup_venv() {
 
         if [ -d "venv" ]; then
             log_info "Virtual environment already exists, recreating..."
-            rm -rf venv
+            venv_snapshot_take
         fi
 
         "$PYTHON_PATH" -m venv venv
@@ -1390,7 +1433,7 @@ setup_venv() {
 
     if [ -d "venv" ]; then
         log_info "Virtual environment already exists, recreating..."
-        rm -rf venv
+        venv_snapshot_take
     fi
 
     # uv creates the venv and pins the Python version in one step
@@ -1411,6 +1454,9 @@ setup_venv() {
 }
 
 install_deps() {
+    # Roll the previous venv back if anything below fails (see venv_snapshot_take).
+    trap venv_snapshot_restore_on_failure EXIT
+
     log_info "Installing dependencies..."
 
     # Re-pin UV_PYTHON to the venv interpreter. setup_venv already does this,
@@ -1660,6 +1706,11 @@ PY
     fi
 
     log_success "Main package installed"
+
+    # Dependencies are in place: the new venv is proven good, drop the rollback
+    # snapshot and disarm the trap so a later unrelated exit can't restore it.
+    venv_snapshot_discard
+    trap - EXIT
 
     log_success "All dependencies installed"
 }

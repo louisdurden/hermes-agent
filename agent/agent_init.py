@@ -918,6 +918,9 @@ def init_agent(
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
     agent._stream_callback = None
+    # Per-turn delivery boundary for complete-output transforms.
+    agent._buffer_model_output = False
+    agent._output_transform_finalized = False
     # Deferred paragraph break flag — set after tool iterations so a
     # single "\n\n" is prepended to the next real text delta.
     agent._stream_needs_break = False

@@ -4097,6 +4097,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            text_emitted = False
 
             # Role chunk
             role_chunk = {
@@ -4118,12 +4119,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal text_emitted
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    text_emitted = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -4178,6 +4181,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.error(
                     "Agent task %s failed during SSE streaming: %s", completion_id, exc
                 )
+
+            # A complete-output transform deliberately suppresses every model
+            # delta. Deliver the transformed final response as one SSE content
+            # chunk instead of returning an empty successful completion.
+            agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+            if agent_final and not text_emitted:
+                last_activity = await _emit(agent_final)
 
             # Inspect the result dict for a flagged (non-exception) failure.
             is_partial = bool(result.get("partial")) if isinstance(result, dict) else False

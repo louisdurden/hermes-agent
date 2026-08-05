@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -53,5 +55,68 @@ def test_no_recovery_file_on_empty_history(tmp_path, monkeypatch):
     )
     flush_agent_history_to_file("sess:abc123", [])
     assert not list(flush_dir.glob("*.json"))
+
+
+def test_unfinalized_required_transform_recovery_excludes_assistant_bytes(
+    tmp_path, monkeypatch
+):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    history = [
+        {"role": "user", "content": "prior user input"},
+        {"role": "assistant", "content": "safe prior assistant output"},
+        {"role": "user", "content": "safe user input"},
+        {
+            "role": "assistant",
+            "content": "PROVISIONAL_OUTPUT",
+            "reasoning": "PROVISIONAL_REASONING",
+        },
+    ]
+
+    flush_agent_history_to_file(
+        "sess:abc123", history, include_assistant=False
+    )
+
+    files = list(flush_dir.glob("*.json"))
+    assert files
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    serialized = json.dumps(data)
+    assert "safe prior assistant output" in serialized
+    assert "safe user input" in serialized
+    assert "PROVISIONAL_OUTPUT" not in serialized
+    assert "PROVISIONAL_REASONING" not in serialized
+    assert data["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_gateway_marks_unfinalized_required_transform_history_unsafe():
+    from gateway.run import GatewayRunner
+
+    agent = SimpleNamespace(
+        session_id="sess:abc123",
+        _buffer_model_output=True,
+        _output_transform_finalized=False,
+        _session_messages=[
+            {"role": "user", "content": "safe"},
+            {"role": "assistant", "content": "PROVISIONAL_OUTPUT"},
+        ],
+        _flush_messages_to_session_db=lambda _messages: (_ for _ in ()).throw(
+            RuntimeError("synthetic flush failure")
+        ),
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+
+    with (
+        patch("gateway.shutdown_flush.flush_agent_history_to_file") as preserve,
+        patch("hermes_cli.lifecycle.finalize_session"),
+    ):
+        await runner._finalize_shutdown_agents({"synthetic": agent})
+
+    preserve.assert_called_once_with(
+        "sess:abc123", agent._session_messages, include_assistant=False
+    )
 
 

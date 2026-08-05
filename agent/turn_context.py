@@ -430,6 +430,12 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    # Complete-output transforms are a delivery boundary: provider streaming
+    # may continue internally, but model prose stays buffered until transformed.
+    from hermes_cli.lifecycle import output_transform_requires_buffering
+
+    agent._buffer_model_output = output_transform_requires_buffering()
+    agent._output_transform_finalized = False
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None

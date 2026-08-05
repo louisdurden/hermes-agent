@@ -272,6 +272,8 @@ def recover_pending_to_db(
 def flush_agent_history_to_file(
     session_id: Optional[str],
     history: list,
+    *,
+    include_assistant: bool = True,
 ) -> None:
     """Best-effort dump of an agent's in-memory transcript before teardown.
 
@@ -290,8 +292,23 @@ def flush_agent_history_to_file(
     try:
         flush_dir = _get_flush_dir()
         snapshot = []
-        for _m in history:
+        last_user_index = max(
+            (
+                index
+                for index, message in enumerate(history)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            default=-1,
+        )
+        for index, _m in enumerate(history):
             try:
+                if (
+                    not include_assistant
+                    and isinstance(_m, dict)
+                    and _m.get("role") == "assistant"
+                    and index > last_user_index
+                ):
+                    continue
                 snapshot.append(
                     _m if isinstance(_m, (dict, list, str, int, float, bool, type(None)))
                     else str(_m)
