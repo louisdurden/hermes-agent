@@ -7,6 +7,15 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[options]
+exclude-newer = "2026-07-22T15:35:45.126024Z"
+exclude-newer-span = "P14D"
+
+[options.exclude-newer-package]
+nemo-relay = false
+vercel = false
+huggingface-hub = false
+
 [manifest]
 overrides = [{ name = "pynacl", specifier = ">=1.6,<1.7" }]
 
