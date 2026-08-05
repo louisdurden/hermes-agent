@@ -88,7 +88,7 @@ export function useGeminiLiveConversation() {
     setStatus('speaking')
 
     source.onended = () => {
-      scheduledSourcesRef.current = scheduledSourcesRef.current.filter((s) => s !== source)
+      scheduledSourcesRef.current = scheduledSourcesRef.current.filter(s => s !== source)
 
       if (scheduledSourcesRef.current.length === 0) {
         setStatus('listening')
@@ -114,7 +114,7 @@ export function useGeminiLiveConversation() {
       source.connect(processor)
       processor.connect(context.destination)
 
-      processor.onaudioprocess = (event) => {
+      processor.onaudioprocess = event => {
         if (!runningRef.current || ws.readyState !== WebSocket.OPEN) {
           return
         }
@@ -136,13 +136,11 @@ export function useGeminiLiveConversation() {
           binary += String.fromCharCode(bytes[i])
         }
 
-        ws.send(
-          JSON.stringify({ realtimeInput: { audio: { data: btoa(binary), mimeType: 'audio/pcm;rate=16000' } } })
-        )
+        ws.send(JSON.stringify({ realtimeInput: { audio: { data: btoa(binary), mimeType: 'audio/pcm;rate=16000' } } }))
       }
 
       setStatus('listening')
-    })().catch((error) => notifyError(error, 'No pude activar el micrófono para el modo de voz en vivo.'))
+    })().catch(error => notifyError(error, 'No pude activar el micrófono para el modo de voz en vivo.'))
   }, [])
 
   const stopMic = useCallback(() => {
@@ -157,7 +155,7 @@ export function useGeminiLiveConversation() {
     }
 
     if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((track) => track.stop())
+      micStreamRef.current.getTracks().forEach(track => track.stop())
       micStreamRef.current = null
     }
   }, [])
@@ -192,10 +190,13 @@ export function useGeminiLiveConversation() {
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
-    ws.onmessage = (event) => {
+    ws.onmessage = event => {
       let data: {
         error?: string
-        serverContent?: { modelTurn?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> }; interrupted?: boolean }
+        serverContent?: {
+          modelTurn?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> }
+          interrupted?: boolean
+        }
         type?: string
       }
 
@@ -209,7 +210,9 @@ export function useGeminiLiveConversation() {
         setStatus('error')
         notifyError(
           new Error(data.error || 'gemini-live bridge error'),
-          data.error ? `El puente de voz en vivo falló: ${data.error}` : 'El puente de voz en vivo falló del lado del servidor.'
+          data.error
+            ? `El puente de voz en vivo falló: ${data.error}`
+            : 'El puente de voz en vivo falló del lado del servidor.'
         )
 
         return

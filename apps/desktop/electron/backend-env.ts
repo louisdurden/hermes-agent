@@ -90,11 +90,7 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
   return resolved
 }
 
-function resolveBackendVenvRoot(
-  root,
-  python,
-  { pathModule = pathModuleForPlatform(process.platform) }: any = {}
-) {
+function resolveBackendVenvRoot(root, python, { pathModule = pathModuleForPlatform(process.platform) }: any = {}) {
   const resolvedPython = pathModule.resolve(String(python || ''))
 
   for (const name of ['.venv', 'venv']) {
