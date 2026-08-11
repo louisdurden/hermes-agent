@@ -125,6 +125,35 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_goal_verdict_stages_durable_status_without_live_send(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("polish the docs")
+    effects = []
+
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="here's a partial edit",
+            durable_effects=effects,
+        )
+
+    assert adapter.sends == []
+    assert len(effects) == 1
+    assert effects[0]["effect_key"] == "goal-status"
+    assert effects[0]["kind"] == "goal_status_notice"
+    assert "Continuing toward goal" in effects[0]["payload"]["content"]
+    assert adapter._pending_messages
+
+
+@pytest.mark.asyncio
 async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""

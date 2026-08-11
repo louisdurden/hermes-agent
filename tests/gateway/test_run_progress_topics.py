@@ -641,6 +641,27 @@ class BackgroundReviewAgent:
         }
 
 
+class DurableQueuedFollowupAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        response = "first durable answer" if type(self).calls == 1 else "follow-up durable answer"
+        if self.stream_delta_callback:
+            self.stream_delta_callback(response)
+        return {
+            "final_response": response,
+            "response_previewed": bool(self.stream_delta_callback),
+            "messages": [],
+            "api_calls": 1,
+            "history_offset": len(conversation_history or []),
+        }
+
+
 class VerboseAgent:
     """Agent that emits a tool call with args whose JSON exceeds 200 chars."""
     LONG_CODE = "x" * 300
@@ -669,6 +690,8 @@ async def _run_with_agent(
     *,
     session_id,
     pending_text=None,
+    pending_turn_id=None,
+    durable_turn_id=None,
     config_data=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
@@ -711,6 +734,7 @@ async def _run_with_agent(
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+            metadata={"_hermes_turn_id": pending_turn_id} if pending_turn_id else {},
         )
 
     result = await runner._run_agent(
@@ -720,8 +744,119 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        durable_turn_id=durable_turn_id,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_recursive_wal_followup_is_buffered_and_propagates_turn_ids(monkeypatch, tmp_path):
+    DurableQueuedFollowupAgent.calls = 0
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_durable_delivery_enabled", lambda: True)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DurableQueuedFollowupAgent,
+        session_id="sess-durable-followup",
+        pending_text="second request",
+        pending_turn_id="turn-followup",
+        durable_turn_id="turn-primary",
+        config_data={
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+            },
+        },
+    )
+
+    assert DurableQueuedFollowupAgent.calls == 2
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert result["_hermes_inbound_turn_ids"] == ["turn-followup"]
+    assert result["final_response"] == "first durable answer\n\nfollow-up durable answer"
+
+
+@pytest.mark.asyncio
+async def test_recursive_wal_followup_suppresses_interim_until_durable_plan(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_durable_delivery_enabled", lambda: True)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-durable-interim-followup",
+        pending_text="second request",
+        pending_turn_id="turn-followup",
+        durable_turn_id="turn-primary",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+        },
+    )
+
+    assert QueuedCommentaryAgent.calls == 2
+    assert adapter.sent == []
+    assert result["_hermes_inbound_turn_ids"] == ["turn-followup"]
+    assert result["final_response"] == "final response 1\n\nfinal response 2"
+
+
+@pytest.mark.asyncio
+async def test_recursive_wal_followup_defers_background_review_until_post_delivery(monkeypatch, tmp_path):
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_durable_delivery_enabled", lambda: True)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-durable-background-followup",
+        pending_text="second request",
+        pending_turn_id="turn-followup",
+        durable_turn_id="turn-primary",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+        },
+    )
+
+    assert adapter.sent == []
+    assert adapter._post_delivery_callbacks == {}
+    collector = result["_hermes_background_review_effect_collector"]
+    captured = collector.seal(lambda effect: None)
+    assert [effect["payload"]["content"] for effect in captured] == [
+        "💾 Skill 'prospect-scanner' created.",
+        "💾 Skill 'prospect-scanner' created.",
+    ]
+    assert result["_hermes_inbound_turn_ids"] == ["turn-followup"]
+    assert result["final_response"] == "done\n\ndone"
+
+
+def test_durable_background_review_collector_routes_late_notice_after_seal():
+    gateway_run = importlib.import_module("gateway.run")
+    collector = gateway_run._DurableBackgroundReviewCollector()
+    collector.add("first")
+
+    late = []
+    captured = collector.seal(late.append)
+    collector.add("second")
+
+    assert captured == [{
+        "effect_key": "background-review:0",
+        "kind": "background_review_notice",
+        "payload": {"content": "first"},
+    }]
+    assert late == [{
+        "effect_key": "background-review:1",
+        "kind": "background_review_notice",
+        "payload": {"content": "second"},
+    }]
 
 
 @pytest.mark.asyncio

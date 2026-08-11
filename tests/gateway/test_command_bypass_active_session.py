@@ -16,8 +16,9 @@ import asyncio
 
 import pytest
 
+from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -57,6 +58,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        return SendResult(success=True, message_id="command-ack")
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -159,6 +161,54 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:status" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_status_ack_completes_durable_inbound_and_delivery_plan(
+        self, tmp_path, monkeypatch
+    ):
+        """An inline command ACK must own both delivery and inbound completion."""
+        state_db = tmp_path / "state.db"
+        monkeypatch.setattr(dl, "_db_path", lambda: state_db)
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        class _Runner:
+            async def _prepare_inbound_turn(self, event, session_key):
+                turn_id = "turn-inline-status"
+                dl.record_inbound_turn(
+                    turn_id=turn_id,
+                    session_key=session_key,
+                    platform="telegram",
+                    chat_id=event.source.chat_id,
+                    thread_id=None,
+                    payload={"text": event.text},
+                )
+                return turn_id
+
+            async def _complete_inbound_turn(self, event):
+                dl.mark_inbound_turn_completed(
+                    event.metadata["_hermes_turn_id"],
+                    session_key=sk,
+                )
+                return True
+
+        adapter.gateway_runner = _Runner()
+
+        await adapter.handle_message(_make_event("/status"))
+
+        with dl._connect() as conn:
+            inbound = conn.execute(
+                "SELECT state FROM inbound_turns WHERE turn_id='turn-inline-status'"
+            ).fetchone()
+            component = conn.execute(
+                "SELECT state, kind, payload FROM delivery_components "
+                "WHERE turn_id='turn-inline-status'"
+            ).fetchone()
+        assert inbound == ("completed",)
+        assert component is not None
+        assert component[0:2] == ("delivered", "text")
+        assert "handled:status" in component[2]
 
     @pytest.mark.asyncio
     async def test_agents_bypasses_guard(self):

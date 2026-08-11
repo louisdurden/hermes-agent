@@ -40,10 +40,11 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _should_inject_resume_pending,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import SessionEntry, SessionSource, SessionStore, build_session_key
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -70,6 +71,344 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+
+
+def test_current_turn_write_ahead_marker_does_not_fake_a_restart():
+    """The marker written by this turn is for the *next process* only.
+
+    A normal inbound message must not receive restart-recovery guidance merely
+    because the write-ahead marker became visible before the agent thread read
+    the session entry.  A marker inherited from the previous process still
+    activates recovery.
+    """
+    entry = MagicMock(resume_pending=True)
+    assert _should_inject_resume_pending(
+        entry, inherited_at_turn_start=False, interruption_is_fresh=True,
+        resume_mark_is_fresh=True,
+    ) is False
+    assert _should_inject_resume_pending(
+        entry, inherited_at_turn_start=True, interruption_is_fresh=True,
+        resume_mark_is_fresh=True,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_delivery_handoff_requires_and_consumes_success_authorization():
+    runner, _adapter = make_restart_runner()
+    clear_pending = AsyncMock(return_value=True)
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store.clear_resume_pending = clear_pending
+    session_key = "agent:main:telegram:dm:123"
+    turn_a = "turn-a"
+    turn_b = "turn-b"
+
+    assert (
+        await runner._complete_resume_delivery_handoff(session_key, turn_a) is False
+    )
+    clear_pending.assert_not_awaited()
+
+    runner._resume_delivery_handoff_ready[turn_a] = session_key
+    assert (
+        await runner._complete_resume_delivery_handoff(session_key, turn_b) is False
+    )
+    clear_pending.assert_not_awaited()
+
+    assert await runner._complete_resume_delivery_handoff(session_key, turn_a) is True
+    clear_pending.assert_awaited_once_with(session_key)
+    assert turn_a not in runner._resume_delivery_handoff_ready
+
+
+@pytest.mark.asyncio
+async def test_command_is_written_to_inbound_wal_before_dispatch():
+    from gateway import delivery_ledger as dl
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="command-chat")
+    event = MessageEvent(
+        text="/queue inspect",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="command-message-1",
+    )
+    session_key = "agent:main:telegram:dm:command-chat"
+
+    turn_id = await runner._prepare_inbound_turn(event, session_key)
+
+    assert turn_id
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT session_key, state, payload FROM inbound_turns WHERE turn_id=?",
+            (turn_id,),
+        ).fetchone()
+    assert row is not None
+    assert row[0:2] == (session_key, "received")
+    assert '\"text\":\"/queue inspect\"' in row[2]
+
+
+@pytest.mark.asyncio
+async def test_disabled_delivery_ledger_skips_inbound_wal_before_dispatch(monkeypatch):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "ledger_enabled", lambda config=None: False)
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="legacy-chat")
+    event = MessageEvent(
+        text="legacy delivery",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="legacy-message-1",
+    )
+
+    turn_id = await runner._prepare_inbound_turn(
+        event, "agent:main:telegram:dm:legacy-chat"
+    )
+
+    assert turn_id is None
+    assert "_hermes_turn_id" not in event.metadata
+    assert not dl._db_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_completed_platform_event_never_reaches_hooks_or_agent(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    runner._prepare_inbound_turn = GatewayRunner._prepare_inbound_turn.__get__(
+        runner, GatewayRunner
+    )
+    source = make_restart_source(chat_id="dedup-chat")
+    first = MessageEvent(
+        text="once",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="platform-event-1",
+    )
+    session_key = build_session_key(source)
+    turn_id = await runner._prepare_inbound_turn(first, session_key)
+    assert turn_id is not None
+    dl.mark_inbound_turn_completed(turn_id, session_key=session_key)
+    hooks = AsyncMock()
+
+    async def run_agent(event):
+        await hooks(event)
+
+    agent = AsyncMock(side_effect=run_agent)
+    adapter.set_message_handler(agent)
+    duplicate = MessageEvent(
+        text="once",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="platform-event-1",
+    )
+
+    await adapter.handle_message(duplicate)
+    await asyncio.sleep(0)
+
+    hooks.assert_not_awaited()
+    agent.assert_not_awaited()
+    assert adapter._session_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_platform_redelivery_runs_only_one_agent(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    runner._prepare_inbound_turn = GatewayRunner._prepare_inbound_turn.__get__(
+        runner, GatewayRunner
+    )
+    source = make_restart_source(chat_id="race-chat")
+    events = [
+        MessageEvent(
+            text="once",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="platform-race-1",
+        )
+        for _ in range(2)
+    ]
+    session_key = build_session_key(source)
+
+    turn_ids = await asyncio.gather(
+        *(runner._prepare_inbound_turn(event, session_key) for event in events)
+    )
+
+    assert len([turn_id for turn_id in turn_ids if turn_id]) == 1
+    assert sum(bool(event.metadata.get("_hermes_duplicate_inbound")) for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_event_stays_deduplicated_after_session_alias_rebind(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, _adapter = make_restart_runner()
+    runner._prepare_inbound_turn = GatewayRunner._prepare_inbound_turn.__get__(
+        runner, GatewayRunner
+    )
+    source = make_restart_source(chat_id="alias-chat")
+    quick_key = build_session_key(source)
+    canonical_key = f"{quick_key}:topic:canonical"
+    first = MessageEvent(
+        text="once",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="platform-alias-1",
+    )
+    turn_id = await runner._prepare_inbound_turn(first, quick_key)
+    assert turn_id is not None
+    dl.rebind_inbound_turn(turn_id, canonical_key)
+    dl.mark_inbound_turn_completed(turn_id, session_key=canonical_key)
+    runner._continuity_session_aliases = {quick_key: canonical_key}
+    duplicate = MessageEvent(
+        text="once",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="platform-alias-1",
+    )
+
+    duplicate_turn_id = await runner._prepare_inbound_turn(duplicate, quick_key)
+
+    assert duplicate_turn_id is None
+    assert duplicate.metadata["_hermes_duplicate_inbound"] is True
+    with dl._connect() as conn:
+        rows = conn.execute("SELECT turn_id, state FROM inbound_turns").fetchall()
+    assert rows == [(turn_id, "completed")]
+
+
+@pytest.mark.parametrize("kind", ["image", "tts", "voice", "video", "document"])
+@pytest.mark.asyncio
+async def test_ambiguous_multimedia_redelivery_emits_visible_marker_before_media(
+    tmp_path, monkeypatch, kind
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    turn_id = f"turn-{kind}"
+    path = tmp_path / f"artifact-{kind}"
+    path.write_bytes(b"artifact")
+    payload = (
+        {"url": "https://example.test/image.png", "alt": "diagram"}
+        if kind == "image"
+        else {"path": str(path), "caption": "answer"}
+    )
+    session_key = f"agent:main:telegram:dm:{kind}"
+    dl.record_inbound_turn(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id=kind,
+        thread_id=None,
+        payload={"text": "work"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id=kind,
+        thread_id=None,
+        components=[{"kind": kind, "payload": payload}],
+    )[0]
+    dl.mark_delivery_component_failed(component_id, "gateway died mid-send")
+    calls = []
+
+    async def marker(**kwargs):
+        calls.append(("marker", kwargs["content"]))
+        return SendResult(success=True, message_id="marker-ack")
+
+    adapter._send_with_retry = marker
+    adapter._send_image_with_ack = AsyncMock(
+        side_effect=lambda **_kwargs: calls.append(("image", "sent"))
+        or SendResult(success=True, message_id="media-ack")
+    )
+    adapter.play_tts = AsyncMock(
+        side_effect=lambda **_kwargs: calls.append(("tts", "sent"))
+        or SendResult(success=True, message_id="media-ack")
+    )
+    adapter.send_voice = AsyncMock(
+        side_effect=lambda **_kwargs: calls.append(("voice", "sent"))
+        or SendResult(success=True, message_id="media-ack")
+    )
+    adapter.send_video = AsyncMock(
+        side_effect=lambda **_kwargs: calls.append(("video", "sent"))
+        or SendResult(success=True, message_id="media-ack")
+    )
+    adapter.send_document = AsyncMock(
+        side_effect=lambda **_kwargs: calls.append(("document", "sent"))
+        or SendResult(success=True, message_id="media-ack")
+    )
+
+    recovered = await runner._redeliver_pending_delivery_components()
+
+    assert recovered == 1
+    assert calls[0][0] == "marker"
+    assert "Recovered reply" in calls[0][1]
+    assert calls[1][0] == kind
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_media_marker_failure_blocks_media_and_keeps_obligation(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:image-blocked"
+    dl.record_inbound_turn(
+        turn_id="turn-image-blocked",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="image-blocked",
+        thread_id=None,
+        payload={"text": "work"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id="turn-image-blocked",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="image-blocked",
+        thread_id=None,
+        components=[
+            {
+                "kind": "image",
+                "payload": {"url": "https://example.test/image.png", "alt": ""},
+            }
+        ],
+    )[0]
+    dl.mark_delivery_component_failed(component_id, "gateway died mid-send")
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=False, error="marker rejected")
+    )
+    adapter._send_image_with_ack = AsyncMock()
+
+    recovered = await runner._redeliver_pending_delivery_components()
+
+    assert recovered == 0
+    adapter._send_image_with_ack.assert_not_awaited()
+    with dl._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM delivery_components WHERE component_id=?",
+            (component_id,),
+        ).fetchone()[0]
+    assert state == "failed"
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
@@ -312,6 +651,15 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+
+    def test_empty_message_interactive_note_continues_without_human_reconstruction(self):
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True
+        )
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
+        assert "inspect current state with read-only tools" in note
+        assert "do not ask the user to reconstruct" in note
 
 
     def test_resume_pending_fires_without_tool_tail(self):
@@ -572,6 +920,611 @@ async def test_drain_timeout_marks_resume_pending():
 
 
 # ---------------------------------------------------------------------------
+# Abrupt-crash active-turn durability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_active_turn_is_marked_durable_before_session_start_hook(tmp_path):
+    """A SIGKILL can arrive before graceful shutdown gets a chance to mark work.
+
+    The active session therefore must be persisted as resume-pending immediately
+    after its canonical session entry is resolved and before any hook or agent
+    work can create an external effect.  A fresh SessionStore proves the marker
+    reached disk rather than merely changing an in-memory object.
+    """
+    from gateway.run import GatewayRunner
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="abrupt-crash-chat")
+    session_key = runner._session_key_for_source(source)
+    runner.session_store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = runner.session_store.get_or_create_session(source)
+    assert entry.session_key == session_key
+    runner._resume_delivery_handoff_ready["stale-turn"] = session_key
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._is_telegram_topic_lane = lambda source: False
+    runner.hooks.emit = AsyncMock(side_effect=RuntimeError("stop-after-durable-mark"))
+
+    await GatewayRunner._handle_message_with_agent(
+        runner, MessageEvent(text="continue", message_type=MessageType.TEXT, source=source),
+        source, session_key, 1,
+    )
+
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    recovered = reloaded.get_or_create_session(source)
+    assert recovered.session_key == session_key
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "turn_in_progress"
+    assert "stale-turn" not in runner._resume_delivery_handoff_ready
+
+
+@pytest.mark.asyncio
+async def test_canonical_boundary_rebinds_every_represented_inbound_turn():
+    from gateway.run import GatewayRunner
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="canonical-rebind")
+    quick = "agent:main:telegram:dm:canonical-rebind"
+    canonical = "agent:surgical:telegram:dm:canonical-rebind"
+    entry = SessionEntry(
+        session_key=canonical,
+        session_id="sid-canonical",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.mark_resume_pending.return_value = True
+    runner._async_session_store = None
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._is_telegram_topic_lane = lambda source: False
+    runner.hooks.emit = AsyncMock(side_effect=RuntimeError("stop-after-rebind"))
+    event = MessageEvent(
+        text="combined",
+        message_type=MessageType.TEXT,
+        source=source,
+        metadata={
+            "_hermes_turn_id": "turn-primary",
+            "_hermes_inbound_turn_ids": ["turn-primary", "turn-followup"],
+        },
+    )
+
+    with patch("gateway.delivery_ledger.rebind_inbound_turns") as rebind:
+        await GatewayRunner._handle_message_with_agent(
+            runner, event, source, quick, 1
+        )
+
+    rebind.assert_called_once_with(
+        ["turn-primary", "turn-followup"],
+        expected_session_key=quick,
+        canonical_session_key=canonical,
+    )
+    assert event.metadata["_hermes_canonical_session_key"] == canonical
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resumes_turn_in_progress_after_abrupt_crash():
+    """A fresh process must synthesize exactly one continuation for an active
+    turn marker left behind by an ungraceful process death."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="abrupt-crash-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:abrupt-crash-chat",
+        session_id="sid-abrupt",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_session_owned_by_delivery_plan():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="ledger-owned-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:ledger-owned-chat",
+        session_id="sid-ledger-owned",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    with patch(
+        "gateway.delivery_ledger.session_has_delivery_plan",
+        return_value=True,
+    ):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disabled_delivery_ledger_ignores_historical_plan_for_auto_resume():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="legacy-resume-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:legacy-resume-chat",
+        session_id="sid-legacy-resume",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    with (
+        patch("gateway.delivery_ledger.ledger_enabled", return_value=False),
+        patch(
+            "gateway.delivery_ledger.session_has_delivery_plan",
+            return_value=True,
+        ) as has_plan,
+    ):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 1
+    has_plan.assert_not_called()
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_inline_command_plan_preserves_parent_resume_marker(
+    tmp_path, monkeypatch
+):
+    """A bypass command delivery must not finalize another active turn's marker."""
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, _adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:inline-command-chat"
+    turn_id = "inline-command-turn"
+    dl.record_inbound_turn(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="inline-command-chat",
+        thread_id=None,
+        payload={"text": "/status"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="inline-command-chat",
+        thread_id=None,
+        components=[
+            {
+                "kind": "text",
+                "payload": {
+                    "content": "status ok",
+                    "preserve_resume_pending": True,
+                },
+            }
+        ],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    clear_pending = AsyncMock(return_value=True)
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending = clear_pending
+
+    recovered = await runner._recover_inbound_turns()
+
+    assert recovered == 1
+    clear_pending.assert_not_awaited()
+    with dl._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+        ).fetchone()[0]
+    assert state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_runner_completion_binds_all_represented_turns_to_canonical_session(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, _adapter = make_restart_runner()
+    canonical = "agent:surgical:telegram:dm:completion-owner"
+    other = "agent:other:telegram:dm:completion-owner"
+    for turn_id, session_key in (
+        ("turn-primary", canonical),
+        ("turn-followup", other),
+    ):
+        dl.record_inbound_turn(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id="completion-owner",
+            thread_id=None,
+            payload={"text": turn_id},
+        )
+    event = MessageEvent(
+        text="combined",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="completion-owner"),
+        metadata={
+            "_hermes_turn_id": "turn-primary",
+            "_hermes_inbound_turn_ids": ["turn-primary", "turn-followup"],
+            "_hermes_canonical_session_key": canonical,
+        },
+    )
+
+    with pytest.raises(ValueError, match="session ownership mismatch"):
+        await runner._complete_inbound_turn(event)
+
+    with dl._connect() as conn:
+        states = dict(conn.execute(
+            "SELECT turn_id, state FROM inbound_turns ORDER BY turn_id"
+        ).fetchall())
+    assert states == {
+        "turn-followup": "received",
+        "turn-primary": "received",
+    }
+
+
+@pytest.mark.asyncio
+async def test_redelivered_inline_command_plan_preserves_parent_resume_marker(
+    tmp_path, monkeypatch
+):
+    """A recovered bypass reply must not consume the interrupted parent marker."""
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    turn_id = "inline-command-redelivery"
+    session_key = "agent:main:telegram:dm:inline-redelivery-chat"
+    dl.record_inbound_turn(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="inline-redelivery-chat",
+        thread_id=None,
+        payload={"text": "/status"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="inline-redelivery-chat",
+        thread_id=None,
+        components=[
+            {
+                "kind": "text",
+                "payload": {
+                    "content": "status ok",
+                    "preserve_resume_pending": True,
+                },
+            }
+        ],
+    )[0]
+    dl.mark_delivery_component_failed(component_id, "gateway died")
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="recovered-ack")
+    )
+    clear_pending = AsyncMock(return_value=True)
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.clear_resume_pending = clear_pending
+
+    recovered = await runner._redeliver_pending_delivery_components()
+
+    assert recovered == 1
+    clear_pending.assert_not_awaited()
+    with dl._connect() as conn:
+        states = conn.execute(
+            "SELECT "
+            "(SELECT state FROM inbound_turns WHERE turn_id=?), "
+            "(SELECT state FROM delivery_components WHERE component_id=?)",
+            (turn_id, component_id),
+        ).fetchone()
+    assert states == ("completed", "delivered")
+
+
+@pytest.mark.asyncio
+async def test_restart_delivers_ready_post_delivery_effect_exactly_once(
+    tmp_path, monkeypatch
+):
+    """A persisted post-delivery notice survives restart without a closure."""
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    turn_id = "turn-durable-effect"
+    session_key = "agent:main:telegram:dm:effect-chat"
+    dl.record_inbound_turn(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="effect-chat",
+        thread_id="topic-7",
+        payload={"text": "work"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="effect-chat",
+        thread_id="topic-7",
+        components=[{"kind": "text", "payload": {"content": "answer"}}],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    effect_id = dl.record_post_delivery_effect(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="effect-chat",
+        thread_id="topic-7",
+        effect_key="goal-status",
+        kind="goal_status_notice",
+        payload={"content": "Goal achieved"},
+    )
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="effect-ack")
+    )
+
+    assert await runner._deliver_ready_post_delivery_effects() == 1
+    assert await runner._deliver_ready_post_delivery_effects() == 0
+
+    adapter.send.assert_awaited_once_with(
+        "effect-chat",
+        "Goal achieved",
+        metadata={"thread_id": "topic-7"},
+    )
+    with dl._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM post_delivery_effects WHERE effect_id=?", (effect_id,)
+        ).fetchone()[0]
+    assert state == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_effects_drain_successive_ordinals_in_one_pass(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    turn_id = "turn-ordered-durable-effects"
+    session_key = "agent:main:telegram:dm:ordered-effect-chat"
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="ordered-effect-chat",
+        thread_id=None,
+        components=[{"kind": "text", "payload": {"content": "answer"}}],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    effect_ids = [
+        dl.record_post_delivery_effect(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id="ordered-effect-chat",
+            thread_id=None,
+            effect_key=f"ordered-{ordinal}",
+            kind="goal_status_notice",
+            payload={"content": content},
+        )
+        for ordinal, content in enumerate(("First notice", "Second notice"))
+    ]
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="effect-ack")
+    )
+
+    assert await runner._deliver_ready_post_delivery_effects() == 2
+    assert [call.args[1] for call in adapter.send.await_args_list] == [
+        "First notice",
+        "Second notice",
+    ]
+    with dl._connect() as conn:
+        states = [
+            conn.execute(
+                "SELECT state FROM post_delivery_effects WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()[0]
+            for effect_id in effect_ids
+        ]
+    assert states == ["delivered", "delivered"]
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_effect_drain_stops_at_first_failure(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    effect_ids = []
+    for turn_id, content in (("turn-a", "Fail first"), ("turn-b", "Do not send")):
+        session_key = f"agent:main:telegram:dm:{turn_id}"
+        component_id = dl.record_delivery_plan(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id=turn_id,
+            thread_id=None,
+            components=[{"kind": "text", "payload": {"content": "answer"}}],
+        )[0]
+        dl.mark_delivery_component_delivered(component_id)
+        effect_ids.append(
+            dl.record_post_delivery_effect(
+                turn_id=turn_id,
+                session_key=session_key,
+                platform="telegram",
+                chat_id=turn_id,
+                thread_id=None,
+                effect_key="stop-on-failure",
+                kind="goal_status_notice",
+                payload={"content": content},
+            )
+        )
+    adapter.send = AsyncMock(side_effect=RuntimeError("transport unavailable"))
+
+    assert await runner._deliver_ready_post_delivery_effects() == 0
+    assert adapter.send.await_count == 1
+    with dl._connect() as conn:
+        states = [
+            conn.execute(
+                "SELECT state FROM post_delivery_effects WHERE effect_id=?",
+                (effect_id,),
+            ).fetchone()[0]
+            for effect_id in effect_ids
+        ]
+    assert states == ["failed", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_effect_checkpoint_failure_labels_retry(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    runner, adapter = make_restart_runner()
+    turn_id = "turn-durable-effect-checkpoint-failure"
+    session_key = "agent:main:telegram:dm:effect-chat"
+    component_id = dl.record_delivery_plan(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="effect-chat",
+        thread_id="topic-7",
+        components=[{"kind": "text", "payload": {"content": "answer"}}],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    effect_id = dl.record_post_delivery_effect(
+        turn_id=turn_id,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="effect-chat",
+        thread_id="topic-7",
+        effect_key="goal-status",
+        kind="goal_status_notice",
+        payload={"content": "Goal achieved"},
+    )
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="effect-ack")
+    )
+    original_mark_delivered = dl.mark_post_delivery_effect_delivered
+    calls = 0
+
+    def fail_first_checkpoint(candidate_effect_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("checkpoint unavailable")
+        original_mark_delivered(candidate_effect_id)
+
+    monkeypatch.setattr(
+        dl, "mark_post_delivery_effect_delivered", fail_first_checkpoint
+    )
+
+    assert await runner._deliver_ready_post_delivery_effects() == 0
+    assert await runner._deliver_ready_post_delivery_effects() == 1
+    assert adapter.send.await_args_list[0].args[1] == "Goal achieved"
+    assert adapter.send.await_args_list[1].args[1] == (
+        dl.RECOVERED_MARKER + "Goal achieved"
+    )
+    assert adapter.send.await_count == 2
+    with dl._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM post_delivery_effects WHERE effect_id=?", (effect_id,)
+        ).fetchone()[0]
+    assert state == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_completed_historical_plan_does_not_block_new_auto_resume(
+    tmp_path, monkeypatch
+):
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="reused-session-chat")
+    session_key = "agent:main:telegram:dm:reused-session-chat"
+    old_turn = "old-completed-turn"
+    dl.record_inbound_turn(
+        turn_id=old_turn,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="reused-session-chat",
+        thread_id=None,
+        payload={"text": "old"},
+    )
+    component_id = dl.record_delivery_plan(
+        turn_id=old_turn,
+        session_key=session_key,
+        platform="telegram",
+        chat_id="reused-session-chat",
+        thread_id=None,
+        components=[{"kind": "text", "payload": {"content": "done"}}],
+    )[0]
+    dl.mark_delivery_component_delivered(component_id)
+    dl.mark_inbound_turn_completed(old_turn, session_key=session_key)
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid-reused",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="turn_in_progress",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Gateway startup auto-resume
 # ---------------------------------------------------------------------------
 
@@ -715,6 +1668,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert scheduled == 1
     assert seen == ["resume-start"]
     assert runner._startup_restore_queue == [inbound]
+    assert inbound.metadata["_hermes_inbound_completion_deferred"] is True
 
     finish_task = asyncio.create_task(runner._finish_startup_restore())
     await asyncio.sleep(0)
@@ -725,7 +1679,87 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
     assert seen == ["resume-start", "inbound:hello"]
     assert runner._startup_restore_queue == []
+    assert "_hermes_inbound_completion_deferred" not in inbound.metadata
     assert runner._startup_restore_in_progress is False
+
+
+def test_stale_resume_candidate_releases_staged_inbound_for_one_replay():
+    from gateway import delivery_ledger as dl
+
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stale-accepted")
+    session_key = "agent:main:telegram:dm:stale-accepted"
+    entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid-stale",
+        created_at=datetime.now() - timedelta(hours=4),
+        updated_at=datetime.now() - timedelta(hours=4),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now() - timedelta(hours=4),
+    )
+    runner.session_store._entries = {session_key: entry}
+    dl.record_inbound_turn(
+        turn_id="accepted-turn",
+        session_key=session_key,
+        platform="telegram",
+        chat_id="stale-accepted",
+        thread_id=None,
+        payload={"text": "accepted"},
+    )
+    dl.release_inbound_turn_claim("accepted-turn")
+    claimed = dl.sweep_recoverable_inbound_turns()
+    runner._startup_inbound_by_session = {session_key: claimed}
+
+    with patch("gateway.delivery_ledger.session_has_delivery_plan", return_value=False):
+        assert runner._schedule_resume_pending_sessions() == 0
+
+    assert runner._startup_inbound_by_session == {}
+    replay = dl.sweep_recoverable_inbound_turns()
+    duplicate = dl.sweep_recoverable_inbound_turns()
+    assert [row["turn_id"] for row in replay] == ["accepted-turn"]
+    assert duplicate == []
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_missing_adapter_releases_inbound_claim():
+    runner, _adapter = make_restart_runner()
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="missing-adapter"),
+        metadata={"_hermes_turn_id": "turn-missing-adapter"},
+    )
+    runner._startup_restore_queue = [event]
+    runner._adapter_for_source = MagicMock(return_value=None)
+    runner._release_inbound_event_claims = AsyncMock(return_value=1)
+
+    assert await runner._drain_startup_restore_queue() == 0
+    runner._release_inbound_event_claims.assert_awaited_once_with(event)
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
+async def test_startup_resume_adapter_exception_releases_claim_before_acceptance():
+    runner, adapter = make_restart_runner()
+    session_key = "agent:main:telegram:dm:resume-failure"
+    event = MessageEvent(
+        text="recover",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="resume-failure"),
+        internal=True,
+        metadata={"_hermes_turn_id": "turn-resume-failure"},
+    )
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("adapter rejected"))
+    runner._release_inbound_event_claims = AsyncMock(return_value=1)
+
+    with pytest.raises(RuntimeError, match="adapter rejected"):
+        await runner._run_startup_resume_event(adapter, event, session_key)
+
+    runner._release_inbound_event_claims.assert_awaited_once_with(event)
 
 
 # ---------------------------------------------------------------------------
