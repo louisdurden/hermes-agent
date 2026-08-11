@@ -111,3 +111,27 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+@pytest.mark.parametrize("name", ["clip.mp3", "clip.mp4"])
+@pytest.mark.asyncio
+async def test_explicit_media_as_document_uses_document_post_stream(
+    tmp_path, monkeypatch, name
+):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, name)
+    adapter = _adapter()
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}),
+        f"MEDIA:{media_file}\n[[as_document]]",
+        _event(),
+        adapter,
+    )
+
+    adapter.send_voice.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="C123CHAN",
+        file_path=str(media_file),
+        metadata={},
+    )
+
+

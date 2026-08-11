@@ -64,6 +64,7 @@ def _make_runner(session_entry: SessionEntry):
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._prepare_inbound_turn = AsyncMock(return_value="queued-turn-id")
     return runner, adapter
 
 
@@ -109,6 +110,9 @@ async def test_queue_preserves_photo_media():
     assert queued.message_type == MessageType.PHOTO
     assert queued.media_urls == ["/tmp/photo-a.jpg"]
     assert queued.media_types == ["image/jpeg"]
+    assert queued.message_id == "q-photo:queue"
+    assert queued.metadata["_hermes_turn_id"] == "queued-turn-id"
+    runner._prepare_inbound_turn.assert_awaited_once_with(queued, sk)
 
 
 @pytest.mark.asyncio
@@ -133,6 +137,31 @@ async def test_queue_preserves_reply_context():
     assert queued.reply_to_text == "the original message"
     assert queued.reply_to_author_id == "a1"
     assert queued.reply_to_author_name == "alice"
+    assert queued.message_id == "q-reply:queue"
+
+
+@pytest.mark.parametrize("agent_state", ["starting", "missing"])
+@pytest.mark.asyncio
+async def test_steer_fallback_gets_distinct_inbound_identity(agent_state):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    agent = _AGENT_PENDING_SENTINEL if agent_state == "starting" else None
+    runner._peek_session_state = lambda _key: SimpleNamespace(
+        turn=SimpleNamespace(agent=agent)
+    )
+    event = MessageEvent(
+        text="/steer follow this",
+        source=_make_source(),
+        message_id=f"steer-{agent_state}",
+    )
+
+    await runner._busy_steer_command(event, sk, event.source)
+
+    queued = adapter._pending_messages[sk]
+    assert queued.message_id == f"steer-{agent_state}:steer"
+    runner._prepare_inbound_turn.assert_awaited_once_with(queued, sk)
 
 
 if __name__ == "__main__":  # pragma: no cover

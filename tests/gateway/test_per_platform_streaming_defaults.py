@@ -21,6 +21,32 @@ def test_buffered_transform_disables_every_partial_delivery_path():
     ) == (False, False, False)
 
 
+def test_durable_inbound_buffers_final_text_and_streaming_tts():
+    from gateway.run import _model_output_delivery_flags
+
+    assert _model_output_delivery_flags(
+        streaming_enabled=True,
+        interim_enabled=True,
+        transform_required=False,
+        durable_final_required=True,
+    ) == (False, False, False)
+
+
+def test_disabled_delivery_ledger_restores_legacy_streaming(monkeypatch):
+    from gateway import delivery_ledger as dl
+    from gateway.run import _durable_delivery_enabled, _model_output_delivery_flags
+
+    monkeypatch.setattr(dl, "ledger_enabled", lambda config=None: False)
+
+    assert _durable_delivery_enabled() is False
+    assert _model_output_delivery_flags(
+        streaming_enabled=True,
+        interim_enabled=True,
+        transform_required=False,
+        durable_final_required=_durable_delivery_enabled(),
+    ) == (True, True, True)
+
+
 def test_output_transform_hook_requires_buffering(monkeypatch):
     from gateway.run import _output_transform_requires_buffering
 

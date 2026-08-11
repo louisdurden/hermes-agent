@@ -12,10 +12,12 @@ import logging
 import os
 import random
 import re
+import shutil
 import socket as _socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import weakref
@@ -45,6 +47,21 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+
+
+class DurableDeliveryCheckpointError(RuntimeError):
+    """Durable component state could not advance before transport."""
+
+
+def _mark_delivery_component_attempting_fail_closed(component_id: str) -> None:
+    try:
+        from gateway.delivery_ledger import mark_delivery_component_attempting
+
+        mark_delivery_component_attempting(component_id)
+    except Exception as exc:
+        raise DurableDeliveryCheckpointError(
+            "delivery component attempting checkpoint failed"
+        ) from exc
 
 
 def _platform_name(platform) -> str:
@@ -159,6 +176,33 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
     return True
+
+
+_DELIVERY_VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
+_DELIVERY_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+
+
+def _delivery_effect_kind_for_path(
+    platform,
+    path: str,
+    *,
+    is_voice: bool = False,
+    force_document: bool = False,
+    source_kind: str = "media",
+) -> str:
+    """Resolve a staged attachment to its exact transport effect."""
+    ext = Path(path).suffix.lower()
+    if force_document:
+        return "document"
+    if ext in _DELIVERY_IMAGE_EXTS and not is_voice:
+        return "image"
+    if source_kind == "media" and should_send_media_as_audio(
+        platform, ext, is_voice=is_voice
+    ):
+        return "voice"
+    if ext in _DELIVERY_VIDEO_EXTS:
+        return "video"
+    return "document"
 
 
 def build_auto_tts_output_path(platform) -> str:
@@ -793,6 +837,57 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
         validate_inbound_media_size(total, media_type=media_type, max_bytes=max_bytes)
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def get_delivery_outbox_dir() -> Path:
+    """Return the durable outbound-artifact directory."""
+    directory = _HERMES_HOME / "cache" / "delivery_outbox"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def stage_delivery_artifact(path: str, turn_id: str) -> str:
+    """Copy an outbound file into a power-loss durable, turn-scoped outbox."""
+    source = Path(path).expanduser().resolve(strict=True)
+    safe_turn = re.sub(r"[^A-Za-z0-9_.-]", "_", turn_id)[:96] or "turn"
+    turn_dir = get_delivery_outbox_dir() / safe_turn
+    turn_dir.mkdir(parents=True, exist_ok=True)
+    suffix = source.suffix[:16]
+    destination = turn_dir / f"artifact-{uuid.uuid4().hex}{suffix}"
+    try:
+        shutil.copy2(source, destination)
+        with destination.open("rb") as artifact:
+            os.fsync(artifact.fileno())
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        for directory in (turn_dir, turn_dir.parent):
+            directory_fd = os.open(directory, directory_flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        try:
+            turn_dir.rmdir()
+        except OSError:
+            pass
+        raise
+    return str(destination)
+
+
+def cleanup_staged_delivery_artifact(path: str) -> None:
+    """Roll back a staged file before the delivery plan takes ownership."""
+    try:
+        root = get_delivery_outbox_dir().resolve()
+        candidate = Path(path).expanduser().resolve()
+        candidate.relative_to(root)
+        candidate.unlink(missing_ok=True)
+        try:
+            candidate.parent.rmdir()
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        logger.debug("staged delivery rollback failed for %s", path, exc_info=True)
 
 
 def get_image_cache_dir() -> Path:
@@ -2432,6 +2527,21 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _merge_inbound_turn_ids(target: MessageEvent, incoming: MessageEvent) -> None:
+    """Carry every durable inbound row represented by a merged event."""
+    turn_ids: List[str] = []
+    for candidate in (target, incoming):
+        metadata = getattr(candidate, "metadata", None) or {}
+        primary = metadata.get("_hermes_turn_id")
+        if isinstance(primary, str) and primary:
+            turn_ids.append(primary)
+        for turn_id in metadata.get("_hermes_inbound_turn_ids") or []:
+            if isinstance(turn_id, str) and turn_id:
+                turn_ids.append(turn_id)
+    if turn_ids:
+        target.metadata["_hermes_inbound_turn_ids"] = list(dict.fromkeys(turn_ids))
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2452,6 +2562,7 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        _merge_inbound_turn_ids(existing, event)
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2493,6 +2604,7 @@ def merge_pending_message_event(
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
 
+        _merge_inbound_turn_ids(event, existing)
     pending_messages[session_key] = event
 
 
@@ -3893,6 +4005,39 @@ class BasePlatformAdapter(ABC):
                 return
         await self.stop_typing(chat_id)
 
+    async def _send_image_with_ack(
+        self,
+        *,
+        chat_id: str,
+        image_url: str,
+        alt_text: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send exactly one image and return the platform transport ACK."""
+        from urllib.parse import unquote as _unquote
+
+        caption = alt_text or None
+        if image_url.startswith("file://"):
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=_unquote(image_url[7:]),
+                caption=caption,
+                metadata=metadata,
+            )
+        if self._is_animation_url(image_url):
+            return await self.send_animation(
+                chat_id=chat_id,
+                animation_url=image_url,
+                caption=caption,
+                metadata=metadata,
+            )
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_url,
+            caption=caption,
+            metadata=metadata,
+        )
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -4880,7 +5025,9 @@ class BasePlatformAdapter(ABC):
             return None
         if isinstance(entry, tuple) and len(entry) == 2:
             entry_generation, callback = entry
-            if generation is not None and int(entry_generation) != int(generation):
+            # A generation-owned callback is fail-closed: an unknown caller
+            # must never consume a newer or stale run's deferred effect.
+            if generation is None or int(entry_generation) != int(generation):
                 return None
             self._post_delivery_callbacks.pop(session_key, None)
             return callback if callable(callback) else None
@@ -5019,6 +5166,35 @@ class BasePlatformAdapter(ABC):
         ):
             return self
         return live_adapter
+
+    async def _clear_resume_pending_after_handoff(
+        self, session_key: str, turn_id: Optional[str]
+    ) -> bool:
+        """Transfer crash recovery ownership from the turn to delivery.
+
+        Clear only after the response is durable in the delivery ledger or a
+        ledger-less transport has acknowledged it.  Failure is fail-safe: both
+        marker and obligation remain, and startup redelivery runs before resume.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        complete_handoff = getattr(
+            runner, "_complete_resume_delivery_handoff", None
+        )
+        if not callable(complete_handoff):
+            return False
+        try:
+            completed = complete_handoff(session_key, turn_id)
+            if inspect.isawaitable(completed):
+                completed = await completed
+            return bool(completed)
+        except Exception:
+            logger.debug(
+                "[%s] clear_resume_pending handoff failed for %s",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
+            return False
 
     async def _send_with_retry(
         self,
@@ -5455,6 +5631,100 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    async def _send_inline_command_response(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        text: Optional[str],
+        ephemeral_ttl: float,
+    ) -> Optional[SendResult]:
+        """Durably own an inline command result before making it observable."""
+        runner = self.gateway_runner
+        complete_inbound = getattr(runner, "_complete_inbound_turn", None)
+        turn_id = event.metadata.get("_hermes_turn_id")
+        component_id: Optional[str] = None
+        thread_meta = _thread_metadata_for_source(
+            event.source, _reply_anchor_for_event(event)
+        )
+
+        if text and turn_id:
+            from gateway.delivery_ledger import (
+                record_delivery_plan,
+            )
+
+            component_ids = record_delivery_plan(
+                turn_id=turn_id,
+                session_key=session_key,
+                platform=str(
+                    getattr(event.source.platform, "value", event.source.platform)
+                ),
+                chat_id=event.source.chat_id,
+                thread_id=getattr(event.source, "thread_id", None),
+                components=[
+                    {
+                        "kind": "text",
+                        "payload": {
+                            "content": text,
+                            "routing_metadata": dict(thread_meta or {}),
+                            "preserve_resume_pending": True,
+                        },
+                    }
+                ],
+                represented_turn_ids=[turn_id],
+            )
+            component_id = component_ids[0]
+            _mark_delivery_component_attempting_fail_closed(component_id)
+
+        if not text:
+            if turn_id and callable(complete_inbound):
+                completed = complete_inbound(event)
+                if inspect.isawaitable(completed):
+                    await completed
+            return None
+
+        try:
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=text,
+                reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta),
+            )
+        except Exception as exc:
+            if component_id:
+                from gateway.delivery_ledger import mark_delivery_component_failed
+
+                mark_delivery_component_failed(component_id, str(exc))
+            raise
+
+        success = bool(getattr(result, "success", False))
+        if component_id:
+            from gateway.delivery_ledger import (
+                mark_delivery_component_delivered,
+                mark_delivery_component_failed,
+            )
+
+            if success:
+                mark_delivery_component_delivered(component_id)
+            else:
+                mark_delivery_component_failed(
+                    component_id,
+                    str(getattr(result, "error", "") or "send failed"),
+                )
+
+        if success and turn_id and callable(complete_inbound):
+            completed = complete_inbound(event)
+            if inspect.isawaitable(completed):
+                await completed
+
+        message_id = getattr(result, "message_id", None)
+        if ephemeral_ttl > 0 and success and message_id:
+            self._schedule_ephemeral_delete(
+                chat_id=event.source.chat_id,
+                message_id=message_id,
+                ttl_seconds=int(ephemeral_ttl),
+            )
+        return result
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -5483,8 +5753,6 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-
         try:
             response = await self._message_handler(event)
             _text, _eph_ttl = self._unwrap_ephemeral(response)
@@ -5493,26 +5761,9 @@ class BasePlatformAdapter(ABC):
             # condition fix — issue #18912).  Previously the send happened
             # after cancel_session_processing, which could silently drop the
             # "/new" confirmation when an agent was actively running.
-            if _text:
-                logger.info(
-                    "[%s] Sending command '/%s' response (%d chars) to %s",
-                    self.name,
-                    cmd,
-                    len(_text),
-                    event.source.chat_id,
-                )
-                _r = await self._send_with_retry(
-                    chat_id=event.source.chat_id,
-                    content=_text,
-                    reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
-                )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
-                    self._schedule_ephemeral_delete(
-                        chat_id=event.source.chat_id,
-                        message_id=_r.message_id,
-                        ttl_seconds=_eph_ttl,
-                    )
+            await self._send_inline_command_response(
+                event, session_key, _text, _eph_ttl
+            )
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -5556,6 +5807,19 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+        # Durable inbound preflight precedes every active-session decision.
+        # Queued follow-ups and clarify replies must survive a hard process
+        # death just as much as the turn that currently owns the session.
+        runner = self.gateway_runner
+        prepare_inbound = getattr(runner, "_prepare_inbound_turn", None)
+        if callable(prepare_inbound):
+            prepared = prepare_inbound(event, session_key)
+            turn_id = await prepared if inspect.isawaitable(prepared) else prepared
+            if turn_id:
+                event.metadata["_hermes_turn_id"] = turn_id
+            if event.metadata.get("_hermes_duplicate_inbound"):
+                return
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -5608,22 +5872,11 @@ class BasePlatformAdapter(ABC):
                     self.name, cmd, session_key,
                 )
                 try:
-                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
-                    if _text:
-                        _r = await self._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=_text,
-                            reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
-                        )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
-                                chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
-                            )
+                    await self._send_inline_command_response(
+                        event, session_key, _text, _eph_ttl
+                    )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -5663,6 +5916,15 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
+                        turn_id = event.metadata.get("_hermes_turn_id")
+                        if isinstance(turn_id, str) and turn_id:
+                            clarify_turns = getattr(
+                                self, "_clarify_inbound_turn_ids", None
+                            )
+                            if clarify_turns is None:
+                                clarify_turns = {}
+                                self._clarify_inbound_turn_ids = clarify_turns
+                            clarify_turns.setdefault(session_key, []).append(turn_id)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
                             _r = await self._send_with_retry(
@@ -5687,6 +5949,15 @@ class BasePlatformAdapter(ABC):
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
+                        turn_id = event.metadata.get("_hermes_turn_id")
+                        if isinstance(turn_id, str) and turn_id:
+                            deferred_turns = getattr(
+                                self, "_clarify_inbound_turn_ids", None
+                            )
+                            if deferred_turns is None:
+                                deferred_turns = {}
+                                self._clarify_inbound_turn_ids = deferred_turns
+                            deferred_turns.setdefault(session_key, []).append(turn_id)
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
@@ -5764,21 +6035,51 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_failed = False
+        inbound_has_non_text_delivery = False
+        delivery_plan_ids: Dict[str, Any] = {}
+        _resume_handed_off = False
+        _post_delivery_callback_session_key = session_key
+        _durable_callback_required = False
+        _durable_plan_persisted = False
+        _durable_callback_turn_id: Optional[str] = None
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_failed = True
+
+        def _record_delivery_error():
+            nonlocal delivery_attempted, delivery_failed
+            delivery_attempted = True
+            delivery_failed = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
-        
+
+        # Inbound write-ahead preflight.  Await the durable row before typing,
+        # reactions, lifecycle hooks, the agent, or tools can run.
+        prepare_inbound = getattr(
+            getattr(self, "gateway_runner", None),
+            "_prepare_inbound_turn",
+            None,
+        )
+        if callable(prepare_inbound):
+            prepared = prepare_inbound(event, session_key)
+            turn_id = await prepared if inspect.isawaitable(prepared) else prepared
+            if turn_id:
+                event.metadata["_hermes_turn_id"] = turn_id
+            if event.metadata.get("_hermes_duplicate_inbound"):
+                return
+
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
@@ -5812,6 +6113,10 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            continuity_session_key = str(
+                event.metadata.get("_hermes_canonical_session_key") or session_key
+            )
+            _post_delivery_callback_session_key = continuity_session_key
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5933,8 +6238,17 @@ class BasePlatformAdapter(ABC):
                 # (#60671) — the gateway streaming-TTS consumer sets the flag.
                 _tts_path = None
                 _tts_requested_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
-                        and event.message_type == MessageType.VOICE
+                _force_durable_tts = bool(
+                    event.metadata.get("_hermes_force_auto_tts")
+                )
+                if ((
+                            self._should_auto_tts_for_chat(event.source.chat_id)
+                            or _force_durable_tts
+                        )
+                        and (
+                            event.message_type == MessageType.VOICE
+                            or _force_durable_tts
+                        )
                         and text_content
                         and not media_files
                         and not self._streaming_tts_turn_completed(
@@ -5969,39 +6283,427 @@ class BasePlatformAdapter(ABC):
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
+                _tts_cleanup_paths = {_tts_requested_path, _tts_path} - {None}
+                telegram_tts_caption = None
+                if (
+                    self.platform == Platform.TELEGRAM
+                    and text_content
+                    and text_content[:1024] == text_content
+                ):
+                    telegram_tts_caption = text_content
+                inbound_has_non_text_delivery = bool(
+                    images or local_files or media_files or _tts_path
+                )
+
+                turn_id = event.metadata.get("_hermes_turn_id")
+                if isinstance(turn_id, str) and turn_id:
+                    try:
+                        from gateway.delivery_ledger import (
+                            ledger_enabled,
+                            record_delivery_plan_with_post_delivery_effects,
+                            record_post_delivery_effect,
+                        )
+
+                        if ledger_enabled():
+                            _durable_callback_required = True
+                            from urllib.parse import quote as _outbox_quote, unquote as _outbox_unquote
+
+                            staged_delivery_paths: List[str] = []
+                            staging_errors: List[str] = []
+                            durable_images: List[Tuple[str, str]] = []
+                            for image_url, alt_text in images:
+                                try:
+                                    if image_url.startswith("file://"):
+                                        cached_path = _outbox_unquote(image_url[7:])
+                                    elif image_url.startswith(("http://", "https://")):
+                                        suffix = Path(urlsplit(image_url).path).suffix or ".jpg"
+                                        cached_path = await cache_image_from_url(
+                                            image_url, ext=suffix[:16]
+                                        )
+                                    else:
+                                        cached_path = image_url
+                                    staged_path = stage_delivery_artifact(
+                                        cached_path, turn_id
+                                    )
+                                    staged_delivery_paths.append(staged_path)
+                                    durable_images.append(
+                                        (f"file://{_outbox_quote(staged_path)}", alt_text)
+                                    )
+                                except Exception:
+                                    staging_errors.append("image")
+                                    logger.warning(
+                                        "could not materialize image in delivery outbox",
+                                        exc_info=True,
+                                    )
+                                    durable_images.append((image_url, alt_text))
+                            images = durable_images
+
+                            staged_media_files: List[Tuple[str, bool]] = []
+                            for media_path, is_voice in media_files:
+                                try:
+                                    media_path = stage_delivery_artifact(
+                                        media_path, turn_id
+                                    )
+                                    staged_delivery_paths.append(media_path)
+                                except Exception:
+                                    staging_errors.append("media")
+                                    logger.warning(
+                                        "could not materialize media in delivery outbox",
+                                        exc_info=True,
+                                    )
+                                staged_media_files.append((media_path, is_voice))
+                            media_files = staged_media_files
+
+                            staged_local_files: List[str] = []
+                            for file_path in local_files:
+                                try:
+                                    file_path = stage_delivery_artifact(
+                                        file_path, turn_id
+                                    )
+                                    staged_delivery_paths.append(file_path)
+                                except Exception:
+                                    staging_errors.append("file")
+                                    logger.warning(
+                                        "could not materialize file in delivery outbox",
+                                        exc_info=True,
+                                    )
+                                staged_local_files.append(file_path)
+                            local_files = staged_local_files
+
+                            if _tts_path:
+                                try:
+                                    _tts_path = stage_delivery_artifact(
+                                        _tts_path, turn_id
+                                    )
+                                    staged_delivery_paths.append(_tts_path)
+                                    _tts_cleanup_paths.add(_tts_path)
+                                except Exception:
+                                    staging_errors.append("tts")
+                                    logger.warning(
+                                        "could not materialize TTS in delivery outbox",
+                                        exc_info=True,
+                                    )
+
+                            if staging_errors:
+                                for staged_path in staged_delivery_paths:
+                                    cleanup_staged_delivery_artifact(staged_path)
+                                raise DurableDeliveryCheckpointError(
+                                    "delivery outbox staging failed for: "
+                                    + ", ".join(staging_errors)
+                                )
+
+                            components: List[Dict[str, Any]] = []
+                            component_keys: List[str] = []
+                            if _tts_path:
+                                component_keys.append("tts")
+                                components.append(
+                                    {
+                                        "kind": "tts",
+                                        "payload": {
+                                            "path": _tts_path,
+                                            "caption": telegram_tts_caption,
+                                            "covers_text": bool(
+                                                telegram_tts_caption and text_content
+                                            ),
+                                        },
+                                    }
+                                )
+                            if text_content:
+                                component_keys.append("text")
+                                components.append(
+                                    {
+                                        "kind": "text",
+                                        "payload": {"content": text_content},
+                                    }
+                                )
+                            for index, (image_url, alt_text) in enumerate(images):
+                                component_keys.append(f"image:{index}")
+                                components.append(
+                                    {
+                                        "kind": "image",
+                                        "payload": {
+                                            "url": image_url,
+                                            "alt": alt_text,
+                                        },
+                                    }
+                                )
+                            for index, (media_path, is_voice) in enumerate(media_files):
+                                component_keys.append(f"media:{index}")
+                                components.append(
+                                    {
+                                        "kind": _delivery_effect_kind_for_path(
+                                            self.platform,
+                                            media_path,
+                                            is_voice=is_voice,
+                                            force_document=force_document_attachments,
+                                            source_kind="media",
+                                        ),
+                                        "payload": {
+                                            "path": media_path,
+                                            "is_voice": is_voice,
+                                        },
+                                    }
+                                )
+                            for index, file_path in enumerate(local_files):
+                                component_keys.append(f"file:{index}")
+                                components.append(
+                                    {
+                                        "kind": _delivery_effect_kind_for_path(
+                                            self.platform,
+                                            file_path,
+                                            force_document=force_document_attachments,
+                                            source_kind="local",
+                                        ),
+                                        "payload": {"path": file_path},
+                                    }
+                                )
+                            if components:
+                                durable_routing_metadata = dict(
+                                    _final_thread_metadata or {}
+                                )
+                                for component in components:
+                                    component["payload"]["routing_metadata"] = dict(
+                                        durable_routing_metadata
+                                    )
+                                clarify_turns_store = getattr(
+                                    self, "_clarify_inbound_turn_ids", {}
+                                )
+                                clarify_turn_ids = list(
+                                    clarify_turns_store.get(session_key, [])
+                                )
+                                represented_turn_ids = list(
+                                    dict.fromkeys(
+                                        [turn_id]
+                                        + [
+                                            candidate
+                                            for candidate in (
+                                                event.metadata.get(
+                                                    "_hermes_inbound_turn_ids"
+                                                )
+                                                or []
+                                            )
+                                            if isinstance(candidate, str) and candidate
+                                        ]
+                                        + [
+                                            candidate
+                                            for candidate in clarify_turn_ids
+                                            if isinstance(candidate, str) and candidate
+                                        ]
+                                    )
+                                )
+                                post_delivery_effects = event.metadata.get(
+                                    "_hermes_post_delivery_effects"
+                                ) or []
+                                if not isinstance(post_delivery_effects, list):
+                                    raise ValueError(
+                                        "invalid durable post-delivery effects"
+                                    )
+                                effect_platform = str(
+                                    getattr(
+                                        event.source.platform,
+                                        "value",
+                                        event.source.platform,
+                                    )
+                                )
+                                plan_commit_finished = threading.Event()
+                                background_review_collector = event.metadata.get(
+                                    "_hermes_background_review_effect_collector"
+                                )
+                                if background_review_collector is not None:
+                                    seal = getattr(background_review_collector, "seal", None)
+                                    if not callable(seal):
+                                        raise ValueError(
+                                            "invalid durable background review collector"
+                                        )
+                                    loop = asyncio.get_running_loop()
+
+                                    def _register_late_background_review(effect):
+                                        # A callback may race the atomic commit
+                                        # immediately after seal.  It cannot
+                                        # return until the plan is visible (or
+                                        # the failed commit is visible as absent).
+                                        plan_commit_finished.wait()
+                                        # Persist synchronously before returning to
+                                        # the worker callback.  Only dispatch is
+                                        # scheduled: a process death after this
+                                        # point leaves a recoverable ledger row.
+                                        record_post_delivery_effect(
+                                            turn_id=turn_id,
+                                            session_key=continuity_session_key,
+                                            platform=effect_platform,
+                                            chat_id=event.source.chat_id,
+                                            thread_id=getattr(
+                                                event.source, "thread_id", None
+                                            ),
+                                            effect_key=effect.get("effect_key"),
+                                            kind=effect.get("kind"),
+                                            payload=effect.get("payload"),
+                                        )
+
+                                        async def _dispatch():
+                                            deliver_effects = getattr(
+                                                self.gateway_runner,
+                                                "_deliver_ready_post_delivery_effects",
+                                                None,
+                                            )
+                                            if callable(deliver_effects):
+                                                await deliver_effects()
+
+                                        loop.call_soon_threadsafe(
+                                            lambda: asyncio.create_task(
+                                                _dispatch()
+                                            )
+                                        )
+
+                                    post_delivery_effects.extend(
+                                        seal(_register_late_background_review)
+                                    )
+                                    collector_store = getattr(
+                                        self,
+                                        "_durable_background_review_collectors",
+                                        None,
+                                    )
+                                    if (
+                                        isinstance(collector_store, dict)
+                                        and collector_store.get(session_key)
+                                        is background_review_collector
+                                    ):
+                                        collector_store.pop(session_key, None)
+                                try:
+                                    ids = record_delivery_plan_with_post_delivery_effects(
+                                        turn_id=turn_id,
+                                        session_key=continuity_session_key,
+                                        platform=effect_platform,
+                                        chat_id=event.source.chat_id,
+                                        thread_id=getattr(
+                                            event.source, "thread_id", None
+                                        ),
+                                        components=components,
+                                        represented_turn_ids=represented_turn_ids,
+                                        post_delivery_effects=post_delivery_effects,
+                                    )
+                                finally:
+                                    plan_commit_finished.set()
+                                _durable_plan_persisted = True
+                                _durable_callback_turn_id = turn_id
+                                if clarify_turn_ids:
+                                    transferred = set(clarify_turn_ids)
+                                    remaining = [
+                                        candidate
+                                        for candidate in clarify_turns_store.get(
+                                            session_key, []
+                                        )
+                                        if candidate not in transferred
+                                    ]
+                                    if remaining:
+                                        clarify_turns_store[session_key] = remaining
+                                    else:
+                                        clarify_turns_store.pop(session_key, None)
+                                delivery_plan_ids = dict(zip(component_keys, ids))
+                                _resume_handed_off = (
+                                    await self._clear_resume_pending_after_handoff(
+                                        continuity_session_key, turn_id
+                                    )
+                                )
+                                if not _resume_handed_off:
+                                    raise DurableDeliveryCheckpointError(
+                                        "durable delivery handoff could not be completed"
+                                    )
+                    except Exception as exc:
+                        logger.error(
+                            "delivery component plan or handoff failed", exc_info=True
+                        )
+                        if (
+                            _durable_callback_required
+                            and not isinstance(exc, DurableDeliveryCheckpointError)
+                        ):
+                            raise DurableDeliveryCheckpointError(
+                                "durable delivery plan persistence failed"
+                            ) from exc
+                        raise
+
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
-                _tts_cleanup_paths = {_tts_requested_path, _tts_path} - {None}
                 if _tts_path and Path(_tts_path).exists():
+                    tts_component_id = delivery_plan_ids.get("tts")
+                    tts_success = False
+                    tts_cleanup_safe = False
                     try:
+                        if tts_component_id:
+                            _mark_delivery_component_attempting_fail_closed(
+                                tts_component_id
+                            )
                         # Caption eligibility and payload stay on the ORIGINAL
                         # reply text. The spoken script is for synthesis only:
                         # normalization can shrink a long reply below the
                         # 1024-char caption limit, and captioning that spoken
                         # form would suppress the full formatted reply the
                         # user is meant to receive as a separate message.
-                        telegram_tts_caption = None
-                        if (
-                            self.platform == Platform.TELEGRAM
-                            and text_content
-                            and text_content[:1024] == text_content
-                        ):
-                            telegram_tts_caption = text_content
+                        # Caption eligibility was computed before the durable
+                        # plan so live delivery and recovery use identical data.
                         tts_result = await self.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
-                    finally:
-                        for _cleanup_path in _tts_cleanup_paths:
+                        tts_success = bool(getattr(tts_result, "success", False))
+                        if tts_component_id:
+                            from gateway.delivery_ledger import (
+                                mark_delivery_component_delivered,
+                                mark_delivery_components_delivered,
+                                mark_delivery_component_failed,
+                            )
+
+                            if tts_success:
+                                covered_text_id = (
+                                    delivery_plan_ids.get("text")
+                                    if _tts_caption_delivered
+                                    else None
+                                )
+                                if covered_text_id:
+                                    mark_delivery_components_delivered(
+                                        [tts_component_id, covered_text_id]
+                                    )
+                                else:
+                                    mark_delivery_component_delivered(tts_component_id)
+                                tts_cleanup_safe = True
+                            else:
+                                mark_delivery_component_failed(
+                                    tts_component_id,
+                                    str(getattr(tts_result, "error", "") or ""),
+                                )
+                        elif tts_success:
+                            tts_cleanup_safe = True
+                    except DurableDeliveryCheckpointError:
+                        raise
+                    except Exception as tts_delivery_error:
+                        if tts_component_id:
                             try:
-                                os.remove(_cleanup_path)
-                            except OSError:
-                                pass
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_failed,
+                                )
+
+                                mark_delivery_component_failed(
+                                    tts_component_id, str(tts_delivery_error)
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "TTS delivery component update failed",
+                                    exc_info=True,
+                                )
+                        raise
+                    finally:
+                        if tts_cleanup_safe:
+                            for _cleanup_path in _tts_cleanup_paths:
+                                try:
+                                    os.remove(_cleanup_path)
+                                except OSError:
+                                    pass
                 elif _tts_cleanup_paths:
                     for _cleanup_path in _tts_cleanup_paths:
                         try:
@@ -6031,7 +6733,12 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    text_component_id = delivery_plan_ids.get("text")
+                    if text_component_id:
+                        _mark_delivery_component_attempting_fail_closed(
+                            text_component_id
+                        )
+                    if not delivery_plan_ids and not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
@@ -6044,13 +6751,13 @@ class BasePlatformAdapter(ABC):
 
                             if ledger_enabled():
                                 _obligation_id = compute_obligation_id(
-                                    session_key,
+                                    continuity_session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
                                 record_obligation(
                                     obligation_id=_obligation_id,
-                                    session_key=session_key,
+                                    session_key=continuity_session_key,
                                     platform=str(
                                         getattr(event.source.platform, "value",
                                                 event.source.platform)
@@ -6060,6 +6767,12 @@ class BasePlatformAdapter(ABC):
                                     content=text_content,
                                 )
                                 mark_attempting(_obligation_id)
+                                _resume_handed_off = (
+                                    await self._clear_resume_pending_after_handoff(
+                                        continuity_session_key,
+                                        event.metadata.get("_hermes_turn_id"),
+                                    )
+                                )
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -6070,6 +6783,36 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if text_component_id:
+                        try:
+                            from gateway.delivery_ledger import (
+                                mark_delivery_component_delivered,
+                                mark_delivery_component_failed,
+                            )
+
+                            if getattr(result, "success", False):
+                                mark_delivery_component_delivered(text_component_id)
+                            else:
+                                mark_delivery_component_failed(
+                                    text_component_id,
+                                    str(getattr(result, "error", "") or ""),
+                                )
+                        except Exception:
+                            logger.debug(
+                                "text delivery component update failed",
+                                exc_info=True,
+                            )
+                    if (
+                        getattr(result, "success", False)
+                        and not _resume_handed_off
+                        and not inbound_has_non_text_delivery
+                    ):
+                        _resume_handed_off = (
+                            await self._clear_resume_pending_after_handoff(
+                                continuity_session_key,
+                                event.metadata.get("_hermes_turn_id"),
+                            )
+                        )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -6077,9 +6820,12 @@ class BasePlatformAdapter(ABC):
                                 mark_failed,
                             )
 
-                            if getattr(result, "success", False):
+                            if (
+                                getattr(result, "success", False)
+                                and _resume_handed_off
+                            ):
                                 mark_delivered(_obligation_id)
-                            else:
+                            elif not getattr(result, "success", False):
                                 mark_failed(
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
@@ -6106,18 +6852,65 @@ class BasePlatformAdapter(ABC):
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
-                # Send extracted images as native attachments
+                # Send extracted images as independently acknowledged components.
                 if images:
-                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-                    try:
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
-                            metadata=_final_thread_metadata,
-                            human_delay=human_delay,
+                    logger.info(
+                        "[%s] Extracted %d image(s) to send as attachments",
+                        self.name,
+                        len(images),
+                    )
+                    for image_index, (image_url, alt_text) in enumerate(images):
+                        image_component_id = delivery_plan_ids.get(
+                            f"image:{image_index}"
                         )
-                    except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        if human_delay > 0:
+                            await asyncio.sleep(human_delay)
+                        try:
+                            if image_component_id:
+                                _mark_delivery_component_attempting_fail_closed(
+                                    image_component_id
+                                )
+                            image_result = await self._send_image_with_ack(
+                                chat_id=event.source.chat_id,
+                                image_url=image_url,
+                                alt_text=alt_text,
+                                metadata=_final_thread_metadata,
+                            )
+                            _record_delivery(image_result)
+                            if not image_result.success:
+                                raise RuntimeError(
+                                    str(image_result.error or "image send was not acknowledged")
+                                )
+                            if image_component_id:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_delivered,
+                                )
+
+                                mark_delivery_component_delivered(image_component_id)
+                        except DurableDeliveryCheckpointError:
+                            raise
+                        except Exception as image_err:
+                            _record_delivery_error()
+                            if image_component_id:
+                                try:
+                                    from gateway.delivery_ledger import (
+                                        mark_delivery_component_failed,
+                                    )
+
+                                    mark_delivery_component_failed(
+                                        image_component_id, str(image_err)
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "image delivery component update failed",
+                                        exc_info=True,
+                                    )
+                            logger.warning(
+                                "[%s] Error sending image component: %s",
+                                self.name,
+                                image_err,
+                                exc_info=True,
+                            )
 
 
                 # Send extracted media files — route by file type
@@ -6133,33 +6926,83 @@ class BasePlatformAdapter(ABC):
                 from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
-                for media_path, is_voice in media_files:
+                for media_index, (media_path, is_voice) in enumerate(media_files):
                     _ext = Path(media_path).suffix.lower()
                     if (_ext in _IMAGE_EXTS
                             and not is_voice
                             and not force_document_attachments):
-                        _image_paths.append(media_path)
+                        _image_paths.append(
+                            (media_path, delivery_plan_ids.get(f"media:{media_index}"))
+                        )
                     else:
-                        _non_image_media.append((media_path, is_voice))
+                        _non_image_media.append(
+                            (
+                                media_path,
+                                is_voice,
+                                delivery_plan_ids.get(f"media:{media_index}"),
+                            )
+                        )
                 _non_image_local: list = []
-                for file_path in local_files:
+                for file_index, file_path in enumerate(local_files):
                     if (Path(file_path).suffix.lower() in _IMAGE_EXTS
                             and not force_document_attachments):
-                        _image_paths.append(file_path)
+                        _image_paths.append(
+                            (file_path, delivery_plan_ids.get(f"file:{file_index}"))
+                        )
                     else:
-                        _non_image_local.append(file_path)
+                        _non_image_local.append(
+                            (file_path, delivery_plan_ids.get(f"file:{file_index}"))
+                        )
 
                 if _image_paths:
-                    try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_final_thread_metadata,
-                            human_delay=human_delay,
-                        )
-                    except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                    for image_path, component_id in _image_paths:
+                        if human_delay > 0:
+                            await asyncio.sleep(human_delay)
+                        try:
+                            if component_id:
+                                _mark_delivery_component_attempting_fail_closed(
+                                    component_id
+                                )
+                            image_result = await self._send_image_with_ack(
+                                chat_id=event.source.chat_id,
+                                image_url=f"file://{_quote(image_path)}",
+                                metadata=_final_thread_metadata,
+                            )
+                            _record_delivery(image_result)
+                            if not image_result.success:
+                                raise RuntimeError(
+                                    str(image_result.error or "local image send was not acknowledged")
+                                )
+                            if component_id:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_delivered,
+                                )
+
+                                mark_delivery_component_delivered(component_id)
+                        except DurableDeliveryCheckpointError:
+                            raise
+                        except Exception as image_err:
+                            _record_delivery_error()
+                            if component_id:
+                                try:
+                                    from gateway.delivery_ledger import (
+                                        mark_delivery_component_failed,
+                                    )
+
+                                    mark_delivery_component_failed(
+                                        component_id, str(image_err)
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "local image component update failed",
+                                        exc_info=True,
+                                    )
+                            logger.warning(
+                                "[%s] Error sending local image: %s",
+                                self.name,
+                                image_err,
+                                exc_info=True,
+                            )
 
                 if _non_image_media:
                     logger.info(
@@ -6167,18 +7010,27 @@ class BasePlatformAdapter(ABC):
                         self.name,
                         len(_non_image_media),
                     )
-                for media_path, is_voice in _non_image_media:
+                for media_path, is_voice, media_component_id in _non_image_media:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        if media_component_id:
+                            _mark_delivery_component_attempting_fail_closed(
+                                media_component_id
+                            )
                         ext = Path(media_path).suffix.lower()
-                        if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                        if (
+                            not force_document_attachments
+                            and should_send_media_as_audio(
+                                self.platform, ext, is_voice=is_voice
+                            )
+                        ):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
-                        elif ext in _VIDEO_EXTS:
+                        elif not force_document_attachments and ext in _VIDEO_EXTS:
                             logger.info(
                                 "[%s] Sending video attachment (%s) to %s",
                                 self.name,
@@ -6197,24 +7049,61 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
+                            if media_component_id:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_failed,
+                                )
+
+                                mark_delivery_component_failed(
+                                    media_component_id,
+                                    str(media_result.error or ""),
+                                )
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                media_path,
-                                is_voice=is_voice,
-                                metadata=_final_thread_metadata,
+                            if not media_component_id:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
+                        elif media_component_id:
+                            from gateway.delivery_ledger import (
+                                mark_delivery_component_delivered,
                             )
+
+                            mark_delivery_component_delivered(media_component_id)
+                    except DurableDeliveryCheckpointError:
+                        raise
                     except Exception as media_err:
+                        _record_delivery_error()
+                        if media_component_id:
+                            try:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_failed,
+                                )
+
+                                mark_delivery_component_failed(
+                                    media_component_id, str(media_err)
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "media component update failed", exc_info=True
+                                )
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
-                for file_path in _non_image_local:
+                for file_path, file_component_id in _non_image_local:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        if file_component_id:
+                            _mark_delivery_component_attempting_fail_closed(
+                                file_component_id
+                            )
                         ext = Path(file_path).suffix.lower()
-                        if ext in _VIDEO_EXTS:
+                        if not force_document_attachments and ext in _VIDEO_EXTS:
                             file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
@@ -6226,19 +7115,52 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                         if not file_result.success:
+                            if file_component_id:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_failed,
+                                )
+
+                                mark_delivery_component_failed(
+                                    file_component_id,
+                                    str(file_result.error or ""),
+                                )
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
                                 self.name,
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                file_path,
-                                metadata=_final_thread_metadata,
+                            if not file_component_id:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
+                        elif file_component_id:
+                            from gateway.delivery_ledger import (
+                                mark_delivery_component_delivered,
                             )
+
+                            mark_delivery_component_delivered(file_component_id)
+                    except DurableDeliveryCheckpointError:
+                        raise
                     except Exception as file_err:
+                        _record_delivery_error()
+                        if file_component_id:
+                            try:
+                                from gateway.delivery_ledger import (
+                                    mark_delivery_component_failed,
+                                )
+
+                                mark_delivery_component_failed(
+                                    file_component_id, str(file_err)
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "file component update failed", exc_info=True
+                                )
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -6255,8 +7177,42 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # Determine overall success for the processing hook. Multipart
+            # responses are successful only when every durable component has
+            # reached its terminal delivered state.
+            processing_ok = (
+                delivery_succeeded and not delivery_failed
+                if delivery_attempted
+                else not bool(response)
+            )
+            delivery_plan_is_complete = False
+            turn_id = event.metadata.get("_hermes_turn_id")
+            if delivery_plan_ids and isinstance(turn_id, str):
+                try:
+                    from gateway.delivery_ledger import delivery_plan_complete
+
+                    delivery_plan_is_complete = delivery_plan_complete(turn_id)
+                    processing_ok = delivery_plan_is_complete
+                except Exception:
+                    logger.debug(
+                        "delivery plan completion check failed", exc_info=True
+                    )
+            elif processing_ok and delivery_attempted and not _resume_handed_off:
+                # Adapters used outside GatewayRunner (including lightweight
+                # platform integrations) have no durable inbound turn or
+                # resume marker to transfer.  Their transport ACK remains the
+                # terminal boundary.  A real WAL turn must still fail closed
+                # unless the runner consumes its per-turn handoff capability.
+                if isinstance(turn_id, str) and turn_id:
+                    _resume_handed_off = (
+                        await self._clear_resume_pending_after_handoff(
+                            continuity_session_key,
+                            turn_id,
+                        )
+                    )
+                    processing_ok = _resume_handed_off
+                else:
+                    _resume_handed_off = True
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6271,6 +7227,52 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+
+            handoff_safe = _resume_handed_off or not delivery_attempted
+            if (
+                processing_ok
+                and handoff_safe
+                and not event.metadata.get("_hermes_inbound_completion_deferred")
+                and (
+                    not inbound_has_non_text_delivery
+                    or delivery_plan_is_complete
+                    or not delivery_plan_ids
+                )
+            ):
+                complete_inbound = getattr(
+                    getattr(self, "gateway_runner", None),
+                    "_complete_inbound_turn",
+                    None,
+                )
+                if callable(complete_inbound):
+                    clarify_turns_store = getattr(
+                        self, "_clarify_inbound_turn_ids", {}
+                    )
+                    clarify_turn_ids = list(
+                        clarify_turns_store.get(session_key, [])
+                    )
+                    if clarify_turn_ids:
+                        existing_turn_ids = list(
+                            event.metadata.get("_hermes_inbound_turn_ids") or []
+                        )
+                        primary_turn_id = event.metadata.get("_hermes_turn_id")
+                        if isinstance(primary_turn_id, str) and primary_turn_id:
+                            existing_turn_ids.insert(0, primary_turn_id)
+                        event.metadata["_hermes_inbound_turn_ids"] = list(
+                            dict.fromkeys(existing_turn_ids + clarify_turn_ids)
+                        )
+                    try:
+                        completed = complete_inbound(event)
+                        if inspect.isawaitable(completed):
+                            completed = await completed
+                        if completed and clarify_turn_ids:
+                            clarify_turns_store.pop(session_key, None)
+                    except Exception:
+                        logger.debug(
+                            "[%s] inbound turn completion failed",
+                            self.name,
+                            exc_info=True,
+                        )
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -6326,7 +7328,11 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Delivery checkpoint failures are already durably owned as pending;
+            # sending an unplanned fallback would create an untracked external effect.
+            if isinstance(e, DurableDeliveryCheckpointError):
+                return
+            # Send other errors to the user so they aren't left with radio silence.
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
@@ -6366,13 +7372,34 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
-            if hasattr(self, "pop_post_delivery_callback"):
+            _post_cb = None
+            _durable_delivery_complete = False
+            if _durable_plan_persisted and _durable_callback_turn_id:
+                try:
+                    from gateway.delivery_ledger import delivery_plan_complete
+
+                    _durable_delivery_complete = delivery_plan_complete(
+                        _durable_callback_turn_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "durable delivery completion readback failed",
+                        exc_info=True,
+                    )
+            _post_delivery_ready = (
+                not _durable_callback_required
+                or _durable_delivery_complete
+            )
+            if _post_delivery_ready and hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
-                    session_key,
+                    _post_delivery_callback_session_key,
                     generation=_callback_generation,
                 )
-            else:
-                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+            elif _post_delivery_ready:
+                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(
+                    _post_delivery_callback_session_key,
+                    None,
+                )
             if callable(_post_cb):
                 try:
                     _post_result = _post_cb()
@@ -6383,6 +7410,22 @@ class BasePlatformAdapter(ABC):
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            if _durable_delivery_complete and self.gateway_runner is not None:
+                _deliver_effects = getattr(
+                    self.gateway_runner,
+                    "_deliver_ready_post_delivery_effects",
+                    None,
+                )
+                if callable(_deliver_effects):
+                    try:
+                        _effect_result = _deliver_effects()
+                        if inspect.isawaitable(_effect_result):
+                            await _effect_result
+                    except Exception:
+                        logger.warning(
+                            "durable post-delivery effect dispatch failed",
+                            exc_info=True,
+                        )
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

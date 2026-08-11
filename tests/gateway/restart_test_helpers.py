@@ -64,6 +64,7 @@ def make_restart_runner(
     runner._pending_approvals = {}
     runner._pending_model_notes = {}
     runner._background_tasks = set()
+    runner._resume_delivery_handoff_ready = {}
     runner._draining = False
     runner._restart_requested = False
     runner._signal_initiated_shutdown = False

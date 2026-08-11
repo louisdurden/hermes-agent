@@ -89,6 +89,8 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    durable_turn_id: Optional[str] = None
+    resume_pending_at_turn_start: bool = False
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

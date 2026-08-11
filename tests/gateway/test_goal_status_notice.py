@@ -80,3 +80,36 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
     ]
 
 
+@pytest.mark.asyncio
+async def test_goal_status_notice_stages_durable_intent_without_live_callback():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config = SimpleNamespace(
+        group_sessions_per_user=True, thread_sessions_per_user=False
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent-channel",
+        thread_id="thread-123",
+        user_id="user-1",
+    )
+    effects = []
+
+    await runner._defer_goal_status_notice_after_delivery(
+        source,
+        "✓ Goal achieved: done",
+        durable_effects=effects,
+    )
+
+    assert adapter.calls == []
+    assert adapter.callbacks == {}
+    assert effects == [
+        {
+            "effect_key": "goal-status",
+            "kind": "goal_status_notice",
+            "payload": {"content": "✓ Goal achieved: done"},
+        }
+    ]
+
+
