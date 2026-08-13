@@ -335,6 +335,8 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+# Cap cold-start subprocess launches to avoid CPU/RAM stampedes from uvx/npx.
+_MCP_DISCOVERY_CONCURRENCY = 3
 # While parked (reconnect budget exhausted, tools deregistered) the run task
 # wakes on this cadence and attempts one revival probe. Without it a parked
 # server is unrevivable: its tools are out of the registry, so no tool call
@@ -5933,15 +5935,17 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # connect or by a manual /mcp refresh.
             and not _connect_cooldown_active(k)
         }
-        # Cached entries with no live session are parked or mid-reconnect.
-        # Their tools are deregistered, so nothing else can reach
-        # _signal_reconnect — without this nudge a new session silently
-        # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
-        # (#50170). Wake them now so their tools come back promptly.
+        # Cached entries mid-reconnect can be nudged, but parked servers must
+        # wait for their timed self-probe; discovery has no trigger reason to
+        # distinguish a manual refresh or OAuth recovery from normal startup.
         stale_cached = [
             _servers[k]
             for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
+            if (
+                k in _servers
+                and getattr(_servers[k], "session", None) is None
+                and not getattr(_servers[k], "_was_parked", False)
+            )
         ]
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
@@ -5968,9 +5972,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     async def _discover_all():
         server_names = list(new_servers.keys())
-        # Connect to all servers in PARALLEL
+        sem = asyncio.Semaphore(_MCP_DISCOVERY_CONCURRENCY)
+
+        async def _bounded(name: str, cfg: dict) -> List[str]:
+            async with sem:
+                return await _discover_one(name, cfg)
+
         results = await asyncio.gather(
-            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
+            *(_bounded(name, cfg) for name, cfg in new_servers.items()),
             return_exceptions=True,
         )
         for name, result in zip(server_names, results):

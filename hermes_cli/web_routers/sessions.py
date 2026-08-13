@@ -182,195 +182,198 @@ async def search_sessions(
     if not q or not q.strip():
         return {"results": []}
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            safe_limit = max(1, min(int(limit or 20), 100))
-            source_filter = source or None
-            source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
-            include_sources = [source_filter] if source_filter else (source_list or None)
-            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
-            now = time.time()
+        def _search():
+            db = _open_session_db_for_profile(profile)
+            try:
+                safe_limit = max(1, min(int(limit or 20), 100))
+                source_filter = source or None
+                source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+                include_sources = [source_filter] if source_filter else (source_list or None)
+                exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+                now = time.time()
 
-            # Walk parent_session_id to the compression root, memoized so a
-            # chain of compression segments only costs one walk. We deliberately
-            # stop at branch/delegate edges: those sessions may diverge from the
-            # parent and should remain searchable on their own.
-            root_cache: dict = {}
+                # Walk parent_session_id to the compression root, memoized so a
+                # chain of compression segments only costs one walk. We deliberately
+                # stop at branch/delegate edges: those sessions may diverge from the
+                # parent and should remain searchable on their own.
+                root_cache: dict = {}
 
-            def compression_root(session_id: str) -> str:
-                if not session_id:
-                    return session_id
-                if session_id in root_cache:
-                    return root_cache[session_id]
-                chain = []
-                cur = session_id
-                visited = set()
-                root = session_id
-                while cur and cur not in visited:
-                    visited.add(cur)
-                    chain.append(cur)
-                    if cur in root_cache:
-                        root = root_cache[cur]
-                        break
+                def compression_root(session_id: str) -> str:
+                    if not session_id:
+                        return session_id
+                    if session_id in root_cache:
+                        return root_cache[session_id]
+                    chain = []
+                    cur = session_id
+                    visited = set()
+                    root = session_id
+                    while cur and cur not in visited:
+                        visited.add(cur)
+                        chain.append(cur)
+                        if cur in root_cache:
+                            root = root_cache[cur]
+                            break
+                        try:
+                            s = db.get_session(cur)
+                        except Exception:
+                            s = None
+                        if not s:
+                            root = cur
+                            break
+                        parent = s.get("parent_session_id") if isinstance(s, dict) else None
+                        if not parent:
+                            root = cur
+                            break
+                        try:
+                            parent_session = db.get_session(parent)
+                        except Exception:
+                            parent_session = None
+                        if not parent_session:
+                            root = cur
+                            break
+                        parent_ended_at = parent_session.get("ended_at")
+                        started_at = s.get("started_at")
+                        is_compression_edge = (
+                            parent_session.get("end_reason") == "compression"
+                            and parent_ended_at is not None
+                            and started_at is not None
+                            and started_at >= parent_ended_at
+                        )
+                        if not is_compression_edge:
+                            root = cur
+                            break
+                        cur = parent
+                    for node in chain:
+                        root_cache[node] = root
+                    return root
+
+                tip_cache: dict = {}
+
+                def lineage_tip(root_id: str) -> str:
+                    if root_id in tip_cache:
+                        return tip_cache[root_id]
+                    tip = root_id
                     try:
-                        s = db.get_session(cur)
+                        resolved = db.get_compression_tip(root_id)
+                        if resolved:
+                            tip = resolved
                     except Exception:
-                        s = None
-                    if not s:
-                        root = cur
-                        break
-                    parent = s.get("parent_session_id") if isinstance(s, dict) else None
-                    if not parent:
-                        root = cur
-                        break
+                        pass
+                    tip_cache[root_id] = tip
+                    return tip
+
+                # Both ID matches and content matches share one keyspace, keyed by
+                # compression lineage root, so an id-hit and a content-hit on the
+                # same logical conversation collapse to a single result. The first
+                # hit for a lineage wins; ID matches run first and take priority.
+                seen: dict = {}
+
+                def add_lineage_result(raw_sid: str, payload: dict) -> None:
+                    if not raw_sid:
+                        return
+                    root = compression_root(raw_sid)
+                    if root in seen or len(seen) >= safe_limit:
+                        return
+                    payload = dict(payload)
+                    sid = lineage_tip(root)
+                    payload["session_id"] = sid
+                    payload["lineage_root"] = root
                     try:
-                        parent_session = db.get_session(parent)
+                        row = db.get_session_rich_row(sid)
                     except Exception:
-                        parent_session = None
-                    if not parent_session:
-                        root = cur
-                        break
-                    parent_ended_at = parent_session.get("ended_at")
-                    started_at = s.get("started_at")
-                    is_compression_edge = (
-                        parent_session.get("end_reason") == "compression"
-                        and parent_ended_at is not None
-                        and started_at is not None
-                        and started_at >= parent_ended_at
-                    )
-                    if not is_compression_edge:
-                        root = cur
-                        break
-                    cur = parent
-                for node in chain:
-                    root_cache[node] = root
-                return root
+                        row = None
+                    if row:
+                        payload.update(
+                            {
+                                "id": row.get("id") or sid,
+                                "source": row.get("source"),
+                                "model": row.get("model"),
+                                "title": row.get("title"),
+                                "started_at": row.get("started_at"),
+                                "ended_at": row.get("ended_at"),
+                                "last_active": row.get("last_active") or row.get("started_at"),
+                                "is_active": (
+                                    row.get("ended_at") is None
+                                    and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
+                                ),
+                                "message_count": row.get("message_count") or 0,
+                                "tool_call_count": row.get("tool_call_count") or 0,
+                                "input_tokens": row.get("input_tokens") or 0,
+                                "output_tokens": row.get("output_tokens") or 0,
+                                "preview": row.get("preview"),
+                                "parent_session_id": row.get("parent_session_id"),
+                                "archived": bool(row.get("archived")),
+                            }
+                        )
+                    else:
+                        payload["id"] = sid
+                    seen[root] = payload
 
-            tip_cache: dict = {}
-
-            def lineage_tip(root_id: str) -> str:
-                if root_id in tip_cache:
-                    return tip_cache[root_id]
-                tip = root_id
-                try:
-                    resolved = db.get_compression_tip(root_id)
-                    if resolved:
-                        tip = resolved
-                except Exception:
-                    pass
-                tip_cache[root_id] = tip
-                return tip
-
-            # Both ID matches and content matches share one keyspace, keyed by
-            # compression lineage root, so an id-hit and a content-hit on the
-            # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
-            seen: dict = {}
-
-            def add_lineage_result(raw_sid: str, payload: dict) -> None:
-                if not raw_sid:
-                    return
-                root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
-                    return
-                payload = dict(payload)
-                sid = lineage_tip(root)
-                payload["session_id"] = sid
-                payload["lineage_root"] = root
-                try:
-                    row = db.get_session_rich_row(sid)
-                except Exception:
-                    row = None
-                if row:
-                    payload.update(
+                # Direct ID matches first: users often paste a session id from CLI,
+                # logs, or another Hermes surface. FTS can't find those unless the
+                # id happens to appear in message text. search_sessions_by_id is
+                # SQL-bounded, so this stays cheap even with thousands of sessions.
+                for row in db.search_sessions_by_id(
+                    q,
+                    limit=safe_limit,
+                    include_archived=True,
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                ):
+                    sid = row.get("id")
+                    preview = (row.get("preview") or "").strip()
+                    snippet = preview or f"Session ID: {sid}"
+                    add_lineage_result(
+                        sid,
                         {
-                            "id": row.get("id") or sid,
+                            "snippet": snippet,
+                            "role": None,
                             "source": row.get("source"),
                             "model": row.get("model"),
-                            "title": row.get("title"),
-                            "started_at": row.get("started_at"),
-                            "ended_at": row.get("ended_at"),
-                            "last_active": row.get("last_active") or row.get("started_at"),
-                            "is_active": (
-                                row.get("ended_at") is None
-                                and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
-                            ),
-                            "message_count": row.get("message_count") or 0,
-                            "tool_call_count": row.get("tool_call_count") or 0,
-                            "input_tokens": row.get("input_tokens") or 0,
-                            "output_tokens": row.get("output_tokens") or 0,
-                            "preview": row.get("preview"),
-                            "parent_session_id": row.get("parent_session_id"),
-                            "archived": bool(row.get("archived")),
-                        }
+                            "session_started": row.get("started_at"),
+                        },
                     )
-                else:
-                    payload["id"] = sid
-                seen[root] = payload
 
-            # Direct ID matches first: users often paste a session id from CLI,
-            # logs, or another Hermes surface. FTS can't find those unless the
-            # id happens to appear in message text. search_sessions_by_id is
-            # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(
-                q,
-                limit=safe_limit,
-                include_archived=True,
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-            ):
-                sid = row.get("id")
-                preview = (row.get("preview") or "").strip()
-                snippet = preview or f"Session ID: {sid}"
-                add_lineage_result(
-                    sid,
-                    {
-                        "snippet": snippet,
-                        "role": None,
-                        "source": row.get("source"),
-                        "model": row.get("model"),
-                        "session_started": row.get("started_at"),
-                    },
+                # Auto-add prefix wildcards so partial words match
+                # e.g. "nimb" → "nimb*" matches "nimby"
+                # Preserve quoted phrases and existing wildcards as-is
+                import re
+                terms = []
+                for token in re.findall(r'"[^"]*"|\S+', q.strip()):
+                    if token.startswith('"') or token.endswith("*"):
+                        terms.append(token)
+                    else:
+                        terms.append(token + "*")
+                prefix_query = " ".join(terms)
+                # Over-fetch so lineage dedup can still surface `limit` distinct
+                # conversations even when several hits collapse onto one root.
+                fetch_limit = max(safe_limit * 5, 50)
+                matches = db.search_messages(
+                    query=prefix_query,
+                    source_filter=include_sources,
+                    exclude_sources=exclude_list or None,
+                    limit=fetch_limit,
                 )
 
-            # Auto-add prefix wildcards so partial words match
-            # e.g. "nimb" → "nimb*" matches "nimby"
-            # Preserve quoted phrases and existing wildcards as-is
-            import re
-            terms = []
-            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
-                if token.startswith('"') or token.endswith("*"):
-                    terms.append(token)
-                else:
-                    terms.append(token + "*")
-            prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(
-                query=prefix_query,
-                source_filter=include_sources,
-                exclude_sources=exclude_list or None,
-                limit=fetch_limit,
-            )
+                for m in matches:
+                    if len(seen) >= safe_limit:
+                        break
+                    add_lineage_result(
+                        m["session_id"],
+                        {
+                            "snippet": m.get("snippet", ""),
+                            "role": m.get("role"),
+                            "source": m.get("source"),
+                            "model": m.get("model"),
+                            "session_started": m.get("session_started"),
+                        },
+                    )
+                return {"results": list(seen.values())}
+            finally:
+                db.close()
 
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
-                )
-            return {"results": list(seen.values())}
-        finally:
-            db.close()
+        return await asyncio.to_thread(_search)
     except HTTPException:
         raise
     except Exception:
@@ -513,52 +516,58 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
-        messages = db.message_count()
-        by_source: Dict[str, int] = {}
+    def _stats():
+        db = _open_session_db_for_profile(profile)
         try:
-            by_source = db.session_count_by_source(
-                include_archived=True,
-                exclude_children=True,
-            )
-        except Exception:
-            pass
-        return {
-            "total": total,
-            "active_store": active_store,
-            "archived": archived,
-            "messages": messages,
-            "by_source": by_source,
-        }
-    finally:
-        db.close()
+            total = db.session_count(include_archived=True)
+            active_store = db.session_count(include_archived=False)
+            archived = db.session_count(archived_only=True)
+            messages = db.message_count()
+            by_source: Dict[str, int] = {}
+            try:
+                by_source = db.session_count_by_source(
+                    include_archived=True,
+                    exclude_children=True,
+                )
+            except Exception:
+                pass
+            return {
+                "total": total,
+                "active_store": active_store,
+                "archived": archived,
+                "messages": messages,
+                "by_source": by_source,
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_stats)
 
 
 @manage_router.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
-            _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-        )
-        session["is_default_profile"] = session["profile"] == "default"
-        return session
-    finally:
-        db.close()
+    def _get_session():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            return db.get_session(sid) if sid else None
+        finally:
+            db.close()
+
+    session = await asyncio.to_thread(_get_session)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Always stamp the owning profile — the serving profile is known even
+    # when the request carries no ``?profile=`` (it's this process's own
+    # profile). Stamping only on explicit ``?profile=`` left rows for the
+    # default/primary profile systematically unowned, so multi-profile
+    # clients resolved them to whichever gateway happened to be active
+    # (cross-profile open asymmetry, #67603 family).
+    session["profile"] = (
+        _cron_profile_home(profile)[0] if profile else _cron_default_profile()
+    )
+    session["is_default_profile"] = session["profile"] == "default"
+    return session
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
@@ -656,34 +665,37 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     session from the auto-archive sweep). Any field may be omitted. ``profile``
     targets another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if body.title is None and body.archived is None and body.pinned is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', and/or 'pinned'.",
-            )
-        if body.title is not None:
-            try:
-                db.set_session_title(sid, body.title or "")
-            except ValueError as e:
-                # Title too long, invalid characters, or already in use.
-                raise HTTPException(status_code=400, detail=str(e))
-        if body.archived is not None:
-            db.set_session_archived(sid, body.archived)
-        if body.pinned is not None:
-            db.set_session_pinned(sid, body.pinned)
-        result = {"ok": True, "title": db.get_session_title(sid) or ""}
-        if body.archived is not None:
-            result["archived"] = bool(body.archived)
-        if body.pinned is not None:
-            result["pinned"] = bool(body.pinned)
-        return result
-    finally:
-        db.close()
+    def _rename():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if body.title is None and body.archived is None and body.pinned is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to update; provide 'title', 'archived', and/or 'pinned'.",
+                )
+            if body.title is not None:
+                try:
+                    db.set_session_title(sid, body.title or "")
+                except ValueError as e:
+                    # Title too long, invalid characters, or already in use.
+                    raise HTTPException(status_code=400, detail=str(e))
+            if body.archived is not None:
+                db.set_session_archived(sid, body.archived)
+            if body.pinned is not None:
+                db.set_session_pinned(sid, body.pinned)
+            result = {"ok": True, "title": db.get_session_title(sid) or ""}
+            if body.archived is not None:
+                result["archived"] = bool(body.archived)
+            if body.pinned is not None:
+                result["pinned"] = bool(body.pinned)
+            return result
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_rename)
 
 
 @manage_router.get("/api/sessions/{session_id}/export")
