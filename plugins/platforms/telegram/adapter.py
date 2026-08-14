@@ -597,6 +597,19 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+def _discover_telegram_menu_commands():
+    """Load the CLI registry and derive Telegram menu entries synchronously.
+
+    ``hermes_cli.commands`` imports prompt-toolkit and the CLI command graph;
+    callers must run this helper outside the gateway event loop.
+    """
+    from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+
+    max_commands = telegram_menu_max_commands()
+    menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+    return menu_commands, hidden_count, max_commands
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -3504,6 +3517,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._run_post_connect_housekeeping()
         )
 
+    async def _discover_command_menu_off_loop(self):
+        """Derive menu commands without blocking Telegram polling/liveness."""
+        return await asyncio.to_thread(_discover_telegram_menu_commands)
+
     async def _run_post_connect_housekeeping(self) -> None:
         """Register the command menu, surface the status indicator, and set up
         DM topics — all off the connect path so a slow Bot API call cannot blow
@@ -3519,7 +3536,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
                 if not self._bot:
                     return
                 # Telegram allows up to 100 commands but has an undocumented
@@ -3527,8 +3543,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # keep built-ins plus common skill commands visible while
                 # staying under the threshold; users can tune the cap via
                 # platforms.telegram.extra.command_menu.
-                max_commands = telegram_menu_max_commands()
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                menu_commands, hidden_count, max_commands = await self._discover_command_menu_off_loop()
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall

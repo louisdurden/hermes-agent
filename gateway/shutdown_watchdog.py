@@ -93,6 +93,36 @@ class _LoopLivenessWatchdogHandle:
         return self._thread.is_alive()
 
 
+def _restart_gateway_process(exit_code: int) -> None:
+    """Replace a wedged macOS gateway immediately; fall back to supervisor exit.
+
+    Repeated watchdog exits can place a launchd job into exponential crash
+    throttling.  ``execv`` keeps the same launchd-owned PID slot and therefore
+    restores polling without waiting for launchd to schedule a fresh process.
+    """
+    if sys.platform == "darwin":
+        argv = [sys.executable, "-m", "hermes_cli.main", *sys.argv[1:]]
+        try:
+            # ``execv`` preserves the PID and skips ``atexit`` handlers. Remove
+            # this process's PID record explicitly so the replacement can win
+            # the startup O_EXCL claim instead of rejecting its own stale file.
+            from gateway.status import _get_pid_path, remove_pid_file
+
+            pid_path = _get_pid_path()
+            remove_pid_file()
+            try:
+                os.lstat(pid_path)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError(f"gateway PID record still exists: {pid_path}")
+            os.execv(sys.executable, argv)
+            return
+        except Exception:
+            logger.exception("Gateway self-reexec failed; falling back to supervisor exit")
+    os._exit(exit_code)
+
+
 def _arm_loop_floor_timer(
     loop: asyncio.AbstractEventLoop,
     interval: float = DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S,
@@ -193,7 +223,7 @@ def start_loop_liveness_watchdog(
                 mark_exited(exit_code, reason="loop_liveness_watchdog")
             except Exception:
                 pass
-            os._exit(exit_code)
+            _restart_gateway_process(exit_code)
             return
 
     thread = threading.Thread(

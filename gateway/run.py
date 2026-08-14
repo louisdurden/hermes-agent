@@ -9456,6 +9456,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, event: MessageEvent, session_key: str
     ) -> Optional[str]:
         """Persist a normalized inbound event before any processing hook."""
+        from gateway.delivery_ledger import ledger_enabled
+
+        if not ledger_enabled():
+            return None
         if event.is_command():
             return None
         metadata = getattr(event, "metadata", None)
@@ -9515,11 +9519,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             delivery_plan_complete,
             delivery_plan_exists,
             delivery_plan_terminal,
+            ledger_enabled,
             mark_inbound_turn_completed,
             release_inbound_turn_claim,
             session_has_delivery_plan,
             sweep_recoverable_inbound_turns,
         )
+
+        if not ledger_enabled():
+            return 0
 
         platform_names = {
             str(getattr(platform, "value", platform)) for platform in self.adapters
@@ -10165,6 +10173,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.delivery_ledger import (
             delivery_components_by_kind,
             delivery_plan_complete,
+            ledger_enabled,
             mark_delivery_component_delivered,
             mark_delivery_components_delivered,
             mark_delivery_component_failed,
@@ -10172,6 +10181,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             RECOVERED_MARKER,
             sweep_recoverable_delivery_components,
         )
+
+        if not ledger_enabled():
+            return 0
 
         platform_names = {
             str(getattr(platform, "value", platform)) for platform in self.adapters

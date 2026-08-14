@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ import pytest
 
 from gateway.shutdown_watchdog import (
     _arm_loop_floor_timer,
+    _restart_gateway_process,
     start_loop_liveness_watchdog,
 )
 
@@ -19,6 +21,52 @@ def _immediate_loop() -> MagicMock:
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     loop.call_soon_threadsafe.side_effect = lambda callback: callback()
     return loop
+
+
+def test_darwin_watchdog_replaces_process_without_waiting_for_launchd(tmp_path):
+    calls = []
+    pid_path = tmp_path / "gateway.pid"
+    pid_path.write_text("owned", encoding="utf-8")
+    with (
+        patch("gateway.shutdown_watchdog.sys.platform", "darwin"),
+        patch("gateway.status._get_pid_path", return_value=pid_path),
+        patch(
+            "gateway.status.remove_pid_file",
+            side_effect=lambda: (calls.append("remove_pid_file"), pid_path.unlink()),
+        ) as remove_pid_file,
+        patch(
+            "gateway.shutdown_watchdog.os.execv",
+            side_effect=lambda *_args: calls.append("execv"),
+        ) as execv,
+        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
+        patch("gateway.shutdown_watchdog.sys.argv", ["gateway-entry", "gateway", "run", "--replace"]),
+    ):
+        _restart_gateway_process(75)
+
+    remove_pid_file.assert_called_once_with()
+    execv.assert_called_once_with(
+        sys.executable,
+        [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--replace"],
+    )
+    assert calls == ["remove_pid_file", "execv"]
+    hard_exit.assert_not_called()
+
+
+def test_darwin_watchdog_falls_back_when_pid_record_cannot_be_removed(tmp_path):
+    pid_path = tmp_path / "gateway.pid"
+    pid_path.write_text("still-owned", encoding="utf-8")
+    with (
+        patch("gateway.shutdown_watchdog.sys.platform", "darwin"),
+        patch("gateway.status._get_pid_path", return_value=pid_path),
+        patch("gateway.status.remove_pid_file") as remove_pid_file,
+        patch("gateway.shutdown_watchdog.os.execv") as execv,
+        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
+    ):
+        _restart_gateway_process(75)
+
+    remove_pid_file.assert_called_once_with()
+    execv.assert_not_called()
+    hard_exit.assert_called_once_with(75)
 
 
 def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
@@ -37,7 +85,7 @@ def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
             "gateway.shutdown_watchdog.faulthandler.dump_traceback",
             side_effect=stop_during_dump,
         ) as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch("gateway.shutdown_watchdog._restart_gateway_process", side_effect=exit_codes.append),
     ):
         handle = start_loop_liveness_watchdog(
             loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
@@ -77,7 +125,7 @@ def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
         patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+        patch("gateway.shutdown_watchdog._restart_gateway_process", side_effect=exit_codes.append),
     ):
         handle = start_loop_liveness_watchdog(
             loop,
@@ -116,7 +164,7 @@ def test_loop_liveness_watchdog_stop_after_first_recheck_skips_final_actions():
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
         patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
-        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
+        patch("gateway.shutdown_watchdog._restart_gateway_process") as hard_exit,
     ):
         handle = start_loop_liveness_watchdog(
             loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1

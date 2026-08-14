@@ -6,6 +6,8 @@ background reconnection (#31049).
 """
 
 import sys
+import asyncio
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -53,4 +55,26 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
+
+
+@pytest.mark.asyncio
+async def test_command_menu_discovery_never_blocks_gateway_event_loop(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake"))
+
+    def slow_menu_discovery():
+        time.sleep(0.15)
+        return ([('help', 'Help')], 0)
+
+    monkeypatch.setattr(
+        telegram_mod,
+        "_discover_telegram_menu_commands",
+        slow_menu_discovery,
+        raising=False,
+    )
+
+    menu_task = asyncio.create_task(adapter._discover_command_menu_off_loop())
+    await asyncio.sleep(0.02)
+
+    assert not menu_task.done()
+    assert await menu_task == ([('help', 'Help')], 0)
 
