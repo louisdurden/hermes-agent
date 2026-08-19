@@ -96,6 +96,113 @@ async def test_accepted_telegram_input_recovers_once_through_adapter_and_startup
 
 
 @pytest.mark.asyncio
+async def test_real_adapter_ingress_and_startup_sequence_dispatch_once_with_current_auth(
+    tmp_path, monkeypatch
+):
+    """Two boots recover one accepted update through auth, then replay nothing."""
+    import gateway.telegram_inbound_ledger as ledger
+
+    monkeypatch.setattr(ledger, "get_hermes_home", lambda: tmp_path)
+    event = _event()
+    adapter = _adapter()
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 60
+    adapter._text_batch_split_delay_seconds = 60
+    adapter._should_process_message = lambda message, *, is_command=False: True
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._build_message_event = (
+        lambda message, msg_type, update_id=None: event
+    )
+    adapter._clean_bot_trigger_text = lambda text: text
+    adapter._cache_replied_media = AsyncMock()
+    adapter._apply_telegram_group_observe_attribution = lambda event: event
+    message = SimpleNamespace(
+        text=event.text,
+        from_user=SimpleNamespace(id=42, username="canary", full_name="Canary"),
+        chat=SimpleNamespace(id=123, type="private", is_forum=False),
+        sender_chat=None,
+    )
+    update = SimpleNamespace(
+        update_id=event.platform_update_id,
+        message=message,
+        effective_message=message,
+    )
+
+    # Enter through Telegram's actual text-update handler.  The long debounce
+    # models a process death after PTB accepted the update but before dispatch.
+    await adapter._handle_text_message(update, SimpleNamespace())
+    assert adapter._is_user_authorized_from_message(message) is True
+    assert len(adapter._pending_text_batches) == 1
+    for task in adapter._pending_text_batch_tasks.values():
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+    with ledger._LOCK, ledger._transaction() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM telegram_inbound_obligations WHERE state='accepted'"
+        ).fetchone()[0] == 1
+        conn.execute("UPDATE telegram_inbound_obligations SET owner_pid=999999")
+
+    recovered_adapter = _adapter()
+    recovered_adapter.config.extra = {"allow_from": ["42"]}
+    recovered_adapter._pending_text_batches = {}
+    recovered_adapter._pending_text_batch_tasks = {}
+    recovered_adapter._text_batch_delay_seconds = 0.001
+    recovered_adapter._text_batch_split_delay_seconds = 0.001
+    authenticated_dispatches = []
+
+    async def dispatch_after_current_auth(event):
+        assert str(event.source.user_id) in {
+            str(value) for value in recovered_adapter.config.extra["allow_from"]
+        }
+        obligation_ids = getattr(event, "_telegram_inbound_obligation_ids", None) or [
+            event._telegram_inbound_obligation_id
+        ]
+        assert ledger.mark_execution_started(obligation_ids)
+        authenticated_dispatches.append(event)
+
+    recovered_adapter.handle_message = dispatch_after_current_auth
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: recovered_adapter}
+    runner._redeliver_pending_obligations = AsyncMock(return_value=0)
+    runner._schedule_resume_pending_sessions = lambda: 0
+    runner._finish_startup_restore = AsyncMock()
+
+    with patch.object(ledger, "_owner_alive", return_value=False):
+        assert await runner._reconcile_startup_obligations() == 1
+        await asyncio.sleep(0.02)
+        assert len(authenticated_dispatches) == 1
+        assert await runner._reconcile_startup_obligations() == 0
+        await asyncio.sleep(0.02)
+
+    assert len(authenticated_dispatches) == 1
+    with ledger._LOCK, ledger._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM telegram_inbound_obligations"
+        ).fetchone()[0] == "executing"
+
+
+@pytest.mark.asyncio
+async def test_startup_obligation_reconciliation_fails_closed_before_resume():
+    """An inbound recovery failure cannot fall through to generic auto-resume."""
+    runner = object.__new__(GatewayRunner)
+    runner._redeliver_pending_obligations = AsyncMock(return_value=0)
+    runner._recover_telegram_inbound_obligations = AsyncMock(
+        side_effect=RuntimeError("controlled recovery failure")
+    )
+    scheduled = []
+    runner._schedule_resume_pending_sessions = lambda: scheduled.append(True)
+    runner._finish_startup_restore = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="controlled recovery failure"):
+        await runner._reconcile_startup_obligations()
+
+    assert scheduled == []
+    runner._finish_startup_restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_held_telegram_text_retries_through_durable_journal_before_handle_message():
     """A retry after a journal failure must not bypass the acceptance journal."""
     adapter = _adapter()

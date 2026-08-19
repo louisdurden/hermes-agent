@@ -11961,6 +11961,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return dispatched
 
+    async def _reconcile_startup_obligations(self) -> int:
+        """Run the ordered durable startup handoff before generic auto-resume.
+
+        Keep this sequence as one callable boundary so controlled restart
+        canaries exercise the exact startup order without connecting a real
+        transport.  Any unexpected exception fails closed before a later
+        recovery phase can take ownership of the same session.
+        """
+        await self._redeliver_pending_obligations()
+        recovered = await self._recover_telegram_inbound_obligations()
+        self._schedule_resume_pending_sessions()
+        await self._finish_startup_restore()
+        return recovered
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -13069,13 +13083,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in the ledger — redelivering it (and clearing resume_pending for
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
-        await self._redeliver_pending_obligations()
-        # Telegram's polling offset advances before adapter dispatch. Recover
-        # accepted-but-unstarted input before generic session resumes so it
-        # enters through the ordinary adapter guard exactly once.
-        await self._recover_telegram_inbound_obligations()
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        # Telegram's polling offset advances before adapter dispatch. Reconcile
+        # delivery and accepted-but-unstarted input before generic session
+        # resumes, then release the startup gate. The shared callable is also
+        # the no-network boundary used by the controlled two-boot canary.
+        await self._reconcile_startup_obligations()
 
         # Surface state.db init failures to the user's messaging platforms
         # so they know persistence is broken before losing data (#88235).
