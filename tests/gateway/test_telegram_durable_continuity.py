@@ -84,6 +84,7 @@ async def test_accepted_telegram_input_recovers_once_through_adapter_and_startup
     )
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: recovered_adapter}
+    runner._is_user_authorized = lambda source, *, allow_adapter_delegation=True: True
     with patch.object(ledger, "_owner_alive", return_value=False):
         assert await runner._recover_telegram_inbound_obligations() == 1
         assert await runner._recover_telegram_inbound_obligations() == 0
@@ -165,6 +166,10 @@ async def test_real_adapter_ingress_and_startup_sequence_dispatch_once_with_curr
     recovered_adapter.handle_message = dispatch_after_current_auth
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: recovered_adapter}
+    runner._adapter_profile_for_source = lambda source: None
+    runner._adapter_authorization_is_upstream = lambda platform, profile=None: False
+    runner.pairing_store = None
+    runner.pairing_stores = {}
     runner._redeliver_pending_obligations = AsyncMock(return_value=0)
     runner._schedule_resume_pending_sessions = lambda: 0
     runner._finish_startup_restore = AsyncMock()
@@ -266,6 +271,7 @@ async def test_plain_text_journalled_before_debounce_recovers_once_with_aggregat
     # A new process has no in-memory batch. Startup recovery rebuilds it and
     # dispatches the persisted input once after the normal debounce path.
     recovered_adapter = _adapter()
+    recovered_adapter.config.extra = {"allow_from": ["42"]}
     recovered_adapter._pending_text_batches = {}
     recovered_adapter._pending_text_batch_tasks = {}
     recovered_adapter._text_batch_delay_seconds = 0.001
@@ -273,6 +279,7 @@ async def test_plain_text_journalled_before_debounce_recovers_once_with_aggregat
     recovered_adapter.handle_message = AsyncMock()
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: recovered_adapter}
+    runner._is_user_authorized = lambda source, *, allow_adapter_delegation=True: True
     with patch.object(ledger, "_owner_alive", return_value=False):
         assert await runner._recover_telegram_inbound_obligations() == 2
     await asyncio.sleep(0.02)

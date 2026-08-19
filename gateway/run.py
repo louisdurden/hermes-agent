@@ -11917,20 +11917,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.config import Platform
-            from gateway.telegram_inbound_ledger import claim_recoverable, restore_event
+            from gateway.telegram_inbound_ledger import (
+                claim_recoverable,
+                mark_discarded,
+                restore_event,
+            )
 
             adapter = self.adapters.get(Platform.TELEGRAM)
             if adapter is None:
                 return 0
             rows = await asyncio.to_thread(claim_recoverable)
-        except Exception:
-            logger.debug("Telegram inbound recovery sweep failed", exc_info=True)
-            return 0
+        except Exception as exc:
+            logger.exception("Telegram inbound recovery sweep failed")
+            raise RuntimeError("Telegram inbound recovery sweep failed") from exc
 
         dispatched = 0
         for row in rows:
             try:
                 event = restore_event(row)
+                # Recovery bypasses Telegram's raw Update intake gate, so apply
+                # the gateway's current allowlist before adapter dispatch.  A
+                # sender removed since acceptance is terminally discarded; an
+                # inability to persist that decision aborts startup fail-closed.
+                if not self._is_user_authorized(event.source):
+                    if not await asyncio.to_thread(
+                        mark_discarded, row["obligation_id"]
+                    ):
+                        raise RuntimeError(
+                            "could not discard unauthorized Telegram obligation"
+                        )
+                    logger.warning(
+                        "Discarded recovered Telegram input from unauthorized user %s",
+                        event.source.user_id,
+                    )
+                    continue
                 # Re-enter through Telegram's durable dispatcher.  The restored
                 # event carries the claimed obligation, so the dispatcher must
                 # preserve that claim instead of attempting a second INSERT.
@@ -11951,14 +11971,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Recovered accepted Telegram input for session %s (obligation %s)",
                     row["session_key"], row["obligation_id"],
                 )
-            except Exception:
-                # Keep the claimed row. Replaying it after an uncertain
-                # handoff would violate the no-duplicate execution contract.
+            except Exception as exc:
+                # Keep the claimed row and abort the rest of startup recovery.
+                # Falling through to generic auto-resume after an uncertain
+                # handoff could execute the same session through a second path.
                 logger.exception(
                     "Telegram inbound recovery handoff failed for obligation %s; "
-                    "leaving it sealed to prevent duplicate execution",
+                    "leaving it sealed and aborting startup recovery",
                     row.get("obligation_id"),
                 )
+                raise RuntimeError(
+                    "Telegram inbound recovery handoff failed"
+                ) from exc
         return dispatched
 
     async def _reconcile_startup_obligations(self) -> int:
