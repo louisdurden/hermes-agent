@@ -255,6 +255,7 @@ def sweep_recoverable(
     deliverable_platforms: Optional[set] = None,
     session_profile: Optional[str] = None,
     match_profile: bool = False,
+    reclaim_current_owner: bool = False,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -290,7 +291,10 @@ def sweep_recoverable(
                 row_profile = parts[1] if len(parts) >= 3 and parts[0] == "agent" else None
                 if row_profile != session_profile:
                     continue
-            if _owner_alive(owner_pid, owner_started_at):
+            owned_by_caller = owner_pid == pid and owner_started_at == started
+            if _owner_alive(owner_pid, owner_started_at) and not (
+                reclaim_current_owner and owned_by_caller
+            ):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 conn.execute(
@@ -308,7 +312,7 @@ def sweep_recoverable(
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                   SET state='attempting', owner_pid=?, owner_started_at=?, attempts=attempts+1,
                        updated_at=?
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),

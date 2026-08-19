@@ -11806,6 +11806,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         session_profile: Optional[str] = None,
         match_profile: bool = False,
+        strict: bool = False,
     ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
@@ -11849,9 +11850,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 deliverable_platforms=_deliverable,
                 session_profile=session_profile,
                 match_profile=match_profile,
+                reclaim_current_owner=strict,
             )
-        except Exception:
+        except Exception as exc:
             logger.debug("delivery ledger sweep failed", exc_info=True)
+            if strict:
+                raise RuntimeError("delivery ledger recovery sweep failed") from exc
             return 0
         if not claimed:
             return 0
@@ -11860,16 +11864,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for row in claimed:
             try:
                 platform = Platform(row["platform"])
-            except Exception:
+            except Exception as exc:
                 logger.debug(
                     "obligation %s: unknown platform %r",
                     row["obligation_id"], row.get("platform"),
                 )
+                if strict:
+                    raise RuntimeError("delivery recovery has unknown platform") from exc
                 continue
             adapter = available_adapters.get(platform)
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
+                if strict:
+                    raise RuntimeError("delivery recovery adapter unavailable")
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -11889,8 +11897,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], send_err,
                 )
                 result = None
+            delivered = result is not None and getattr(result, "success", False)
             try:
-                if result is not None and getattr(result, "success", False):
+                session_key = row.get("session_key") or ""
+                if delivered:
+                    # In strict pre-ingress recovery, clear resume ownership
+                    # before terminalizing the delivery row. If either write
+                    # fails, the row remains reclaimable and the polling barrier
+                    # stays shut rather than scheduling an agent replay.
+                    if strict and session_key:
+                        await self.async_session_store.clear_resume_pending(
+                            session_key
+                        )
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
@@ -11905,20 +11923,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
                     )
-            except Exception:
+                    if strict:
+                        raise RuntimeError("delivery recovery send failed")
+            except Exception as exc:
                 logger.debug("delivery ledger update failed", exc_info=True)
+                if strict:
+                    raise RuntimeError("delivery recovery finalization failed") from exc
 
-            # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
-            session_key = row.get("session_key") or ""
-            if session_key:
+            # The answer reached (or was durably retained as owed to) this
+            # session — don't ALSO re-run the turn via the resume path.
+            if session_key and not (strict and delivered):
                 try:
                     await self.async_session_store.clear_resume_pending(session_key)
-                except Exception:
+                except Exception as exc:
                     logger.debug(
                         "clear_resume_pending failed for %s", session_key,
                         exc_info=True,
                     )
+                    if strict:
+                        raise RuntimeError(
+                            "delivery recovery resume cleanup failed"
+                        ) from exc
         return redelivered
 
     def _arm_telegram_polling_ingress(
@@ -11931,19 +11956,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter, "set_before_polling_ingress_handler", None
         )
         if callable(set_ingress_barrier):
-            set_ingress_barrier(
-                lambda adapter=adapter, profile_name=profile_name: (
-                    self._prepare_telegram_polling_ingress(
-                        adapter,
-                        profile_name=profile_name,
-                        session_profile=(
-                            profile_name
-                            if profile_name is not None
-                            else self._active_profile_name()
-                        ),
-                    )
+            session_profile = profile_name
+            if session_profile is None:
+                session_profile = self._active_profile_name()
+                if session_profile == "default":
+                    session_profile = "main"
+
+            async def _barrier(
+                adapter=adapter,
+                profile_name=profile_name,
+                session_profile=session_profile,
+            ):
+                return await self._prepare_telegram_polling_ingress(
+                    adapter,
+                    profile_name=profile_name,
+                    session_profile=session_profile,
                 )
-            )
+
+            set_ingress_barrier(_barrier)
 
     async def _prepare_telegram_polling_ingress(
         self,
@@ -11957,6 +11987,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter_overrides={Platform.TELEGRAM: adapter},
             session_profile=session_profile,
             match_profile=True,
+            strict=True,
         )
         return await self._recover_telegram_inbound_obligations(
             adapter=adapter, profile_name=profile_name, match_profile=True
@@ -16420,6 +16451,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    async def _seal_telegram_execution_claims(self, event: MessageEvent) -> bool:
+        """Seal every durable Telegram row immediately before agent execution."""
+        obligation_ids = getattr(
+            event, "_telegram_inbound_obligation_ids", None
+        ) or [getattr(event, "_telegram_inbound_obligation_id", None)]
+        obligation_ids = list(dict.fromkeys(oid for oid in obligation_ids if oid))
+        if not obligation_ids:
+            return True
+        try:
+            from gateway.telegram_inbound_ledger import mark_execution_started
+
+            if await asyncio.to_thread(mark_execution_started, obligation_ids):
+                return True
+            logger.warning(
+                "Refusing Telegram journalled input with unavailable execution claims %s",
+                obligation_ids,
+            )
+        except Exception:
+            logger.warning(
+                "Refusing Telegram journalled input because execution claim failed",
+                exc_info=True,
+            )
+        return False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -16514,30 +16569,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # execution. A queued recovery remains replayable until the drained
         # turn actually crosses this boundary; sealing before queueing would
         # make the later replay refuse its own already-executing obligation.
-        _telegram_inbound_obligation_ids = getattr(
-            event, "_telegram_inbound_obligation_ids", None
-        ) or [getattr(event, "_telegram_inbound_obligation_id", None)]
-        _telegram_inbound_obligation_ids = [
-            oid for oid in _telegram_inbound_obligation_ids if oid
-        ]
-        if _telegram_inbound_obligation_ids:
-            try:
-                from gateway.telegram_inbound_ledger import mark_execution_started
-
-                if not await asyncio.to_thread(
-                    mark_execution_started, _telegram_inbound_obligation_ids
-                ):
-                    logger.warning(
-                        "Refusing Telegram journalled input with unavailable execution claims %s",
-                        _telegram_inbound_obligation_ids,
-                    )
-                    return None
-            except Exception:
-                logger.warning(
-                    "Refusing Telegram journalled input because execution claim failed",
-                    exc_info=True,
-                )
-                return None
+        if not await self._seal_telegram_execution_claims(event):
+            return None
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -29502,6 +29535,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
+                if not await self._seal_telegram_execution_claims(pending_event):
+                    return result
                 _followup_adapter = self._adapter_for_source(source)
                 if _followup_adapter:
                     try:

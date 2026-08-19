@@ -325,11 +325,16 @@ async def test_pre_polling_barrier_redelivers_before_recovering_inbound():
     adapter = object()
 
     async def redeliver(
-        *, adapter_overrides=None, session_profile=None, match_profile=False
+        *,
+        adapter_overrides=None,
+        session_profile=None,
+        match_profile=False,
+        strict=False,
     ):
         assert adapter_overrides == {Platform.TELEGRAM: adapter}
         assert session_profile is None
         assert match_profile is True
+        assert strict is True
         order.append("delivery")
         return 1
 
@@ -345,6 +350,52 @@ async def test_pre_polling_barrier_redelivers_before_recovering_inbound():
 
     assert await runner._prepare_telegram_polling_ingress(adapter) == 1
     assert order == ["delivery", "inbound"]
+
+
+@pytest.mark.asyncio
+async def test_pre_polling_delivery_sweep_failure_keeps_ingress_closed(monkeypatch):
+    """SQLite recovery errors propagate before any inbound WAL sweep."""
+    import gateway.delivery_ledger as delivery
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._recover_telegram_inbound_obligations = AsyncMock()
+    adapter = object()
+
+    monkeypatch.setattr(delivery, "ledger_enabled", lambda: True)
+
+    def fail_sweep(*args, **kwargs):
+        raise RuntimeError("controlled sqlite failure")
+
+    monkeypatch.setattr(delivery, "sweep_recoverable", fail_sweep)
+
+    with pytest.raises(RuntimeError, match="delivery ledger recovery sweep failed"):
+        await runner._prepare_telegram_polling_ingress(
+            adapter, profile_name=None, session_profile="main"
+        )
+
+    runner._recover_telegram_inbound_obligations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_primary_polling_barrier_maps_default_profile_to_main_namespace():
+    """The primary adapter's delivery filter matches agent:main session keys."""
+    runner = object.__new__(GatewayRunner)
+    runner._active_profile_name = lambda: "default"
+    runner._prepare_telegram_polling_ingress = AsyncMock(return_value=0)
+    captured = {}
+
+    class Adapter:
+        def set_before_polling_ingress_handler(self, handler):
+            captured["handler"] = handler
+
+    adapter = Adapter()
+    runner._arm_telegram_polling_ingress(adapter, Platform.TELEGRAM)
+    await captured["handler"]()
+
+    runner._prepare_telegram_polling_ingress.assert_awaited_once_with(
+        adapter, profile_name=None, session_profile="main"
+    )
 
 
 @pytest.mark.asyncio

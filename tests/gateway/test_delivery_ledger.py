@@ -141,6 +141,21 @@ class TestSweep:
         assert [row["obligation_id"] for row in claimed] == ["research"]
         assert _row("main")["attempts"] == 0
 
+    def test_strict_barrier_can_retry_its_own_failed_claim(self):
+        _record(oid="retry", session_key="agent:main:telegram:dm:1", platform="telegram")
+        dl.mark_failed("retry", "controlled send failure")
+
+        assert dl.sweep_recoverable() == []
+        claimed = dl.sweep_recoverable(
+            deliverable_platforms={"telegram"},
+            session_profile="main",
+            match_profile=True,
+            reclaim_current_owner=True,
+        )
+
+        assert [row["obligation_id"] for row in claimed] == ["retry"]
+        assert claimed[0]["needs_marker"] is True
+
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
