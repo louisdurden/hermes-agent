@@ -11800,7 +11800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(self, adapter_overrides=None) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -11827,11 +11827,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
+            # Only claim rows we can actually send this boot. During Telegram's
+            # pre-polling ingress barrier the initialized adapter is usable for
+            # outbound delivery but has not yet returned from connect(), so it
+            # is supplied explicitly instead of publishing a half-connected
+            # adapter in the runner's shared registry.
+            available_adapters = dict(self.adapters)
+            available_adapters.update(adapter_overrides or {})
             _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
+                getattr(p, "value", str(p)) for p in available_adapters
             }
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
@@ -11852,7 +11856,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            adapter = available_adapters.get(platform)
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
@@ -11907,7 +11911,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    async def _recover_telegram_inbound_obligations(self) -> int:
+    async def _prepare_telegram_polling_ingress(self, adapter) -> int:
+        """Honor delivery-before-WAL recovery before the first new update."""
+        await self._redeliver_pending_obligations(
+            adapter_overrides={Platform.TELEGRAM: adapter}
+        )
+        return await self._recover_telegram_inbound_obligations(adapter=adapter)
+
+    async def _recover_telegram_inbound_obligations(self, adapter=None) -> int:
         """Dispatch once the Telegram inputs accepted before a dead startup.
 
         The inbound ledger claims rows before this method receives them. A
@@ -11923,7 +11934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 restore_event,
             )
 
-            adapter = self.adapters.get(Platform.TELEGRAM)
+            adapter = adapter or self.adapters.get(Platform.TELEGRAM)
             if adapter is None:
                 return 0
             rows = await asyncio.to_thread(claim_recoverable)
@@ -12712,6 +12723,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
+            if platform == Platform.TELEGRAM:
+                set_ingress_barrier = getattr(
+                    adapter, "set_before_polling_ingress_handler", None
+                )
+                if callable(set_ingress_barrier):
+                    set_ingress_barrier(
+                        lambda adapter=adapter: self._prepare_telegram_polling_ingress(
+                            adapter
+                        )
+                    )
             adapter._busy_text_mode = self._busy_text_mode
             _pending_connects.append((platform, platform_config, adapter))
 
@@ -16343,35 +16364,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
-        # The Telegram adapter journals accepted text before scheduling this
-        # runner path. Seal that journal at the first execution boundary. A
-        # crash after this point must not cause a later startup to replay an
-        # input whose agent work may already have started.
-        _telegram_inbound_obligation_ids = getattr(
-            event, "_telegram_inbound_obligation_ids", None
-        ) or [getattr(event, "_telegram_inbound_obligation_id", None)]
-        _telegram_inbound_obligation_ids = [
-            oid for oid in _telegram_inbound_obligation_ids if oid
-        ]
-        if _telegram_inbound_obligation_ids:
-            try:
-                from gateway.telegram_inbound_ledger import mark_execution_started
-
-                if not await asyncio.to_thread(
-                    mark_execution_started, _telegram_inbound_obligation_ids
-                ):
-                    logger.warning(
-                        "Refusing Telegram journalled input with unavailable execution claims %s",
-                        _telegram_inbound_obligation_ids,
-                    )
-                    return None
-            except Exception:
-                logger.warning(
-                    "Refusing Telegram journalled input because execution claim failed",
-                    exc_info=True,
-                )
-                return None
-
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -16445,6 +16437,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             self._queue_startup_restore_event(event)
             return None
+
+        # The Telegram adapter journals accepted text before scheduling this
+        # runner path. Seal that journal only after the startup gate permits
+        # execution. A queued recovery remains replayable until the drained
+        # turn actually crosses this boundary; sealing before queueing would
+        # make the later replay refuse its own already-executing obligation.
+        _telegram_inbound_obligation_ids = getattr(
+            event, "_telegram_inbound_obligation_ids", None
+        ) or [getattr(event, "_telegram_inbound_obligation_id", None)]
+        _telegram_inbound_obligation_ids = [
+            oid for oid in _telegram_inbound_obligation_ids if oid
+        ]
+        if _telegram_inbound_obligation_ids:
+            try:
+                from gateway.telegram_inbound_ledger import mark_execution_started
+
+                if not await asyncio.to_thread(
+                    mark_execution_started, _telegram_inbound_obligation_ids
+                ):
+                    logger.warning(
+                        "Refusing Telegram journalled input with unavailable execution claims %s",
+                        _telegram_inbound_obligation_ids,
+                    )
+                    return None
+            except Exception:
+                logger.warning(
+                    "Refusing Telegram journalled input because execution claim failed",
+                    exc_info=True,
+                )
+                return None
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events

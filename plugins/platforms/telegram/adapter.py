@@ -4296,6 +4296,27 @@ class TelegramAdapter(BasePlatformAdapter):
             "batching": bool(getattr(event, "_hermes_telegram_batching")),
         }
 
+    def set_before_polling_ingress_handler(self, handler) -> None:
+        """Install the one-shot durable-recovery barrier for cold polling."""
+        self._before_polling_ingress_handler = handler
+
+    async def _prepare_update_before_polling_cursor(self, update) -> None:
+        """Recover older durable input before accepting the first new update."""
+        handler = getattr(self, "_before_polling_ingress_handler", None)
+        if handler is not None:
+            lock = getattr(self, "_before_polling_ingress_lock", None)
+            if lock is None:
+                lock = self._before_polling_ingress_lock = asyncio.Lock()
+            async with lock:
+                handler = getattr(self, "_before_polling_ingress_handler", None)
+                if handler is not None:
+                    await handler()
+                    # Consume only after success. A failed recovery keeps the
+                    # barrier armed and propagates through queue.put(), so PTB
+                    # cannot advance its polling cursor.
+                    self._before_polling_ingress_handler = None
+        await self._journal_update_before_polling_cursor(update)
+
     def _attach_polling_ingress_obligation(
         self, update, event: MessageEvent
     ) -> Optional[str]:
@@ -4316,7 +4337,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _build_application_with_durable_ingress(self, builder):
         """Build PTB with a queue that journals before polling offset advance."""
         queue = _DurableTelegramUpdateQueue(
-            self._journal_update_before_polling_cursor
+            self._prepare_update_before_polling_cursor
         )
         configure_queue = getattr(builder, "update_queue", None)
         if configure_queue is not None:

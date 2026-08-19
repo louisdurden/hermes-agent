@@ -186,6 +186,127 @@ async def test_polling_queue_journals_before_cursor_advance_and_recovers_once(
 
 
 @pytest.mark.asyncio
+async def test_polling_ingress_runs_startup_recovery_barrier_before_new_update():
+    """The first polling enqueue cannot overtake durable startup recovery."""
+    adapter = _adapter()
+    order = []
+
+    async def recover_before_ingress():
+        order.append("recover")
+
+    async def journal_update(update):
+        order.append(f"journal:{update.update_id}")
+
+    adapter.set_before_polling_ingress_handler(recover_before_ingress)
+    adapter._journal_update_before_polling_cursor = journal_update
+
+    class FakeBuilder:
+        def update_queue(self, queue):
+            self.queue = queue
+            return self
+
+        def build(self):
+            return SimpleNamespace(update_queue=self.queue)
+
+    app = adapter._build_application_with_durable_ingress(FakeBuilder())
+    await app.update_queue.put(SimpleNamespace(update_id=1))
+    await app.update_queue.put(SimpleNamespace(update_id=2))
+
+    assert order == ["recover", "journal:1", "journal:2"]
+
+
+@pytest.mark.asyncio
+async def test_polling_ingress_recovery_failure_blocks_enqueue_and_rearms():
+    """A failed startup sweep cannot be bypassed by PTB cursor progress."""
+    adapter = _adapter()
+    attempts = 0
+
+    async def fail_recovery():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("controlled recovery failure")
+
+    adapter.set_before_polling_ingress_handler(fail_recovery)
+    adapter._journal_update_before_polling_cursor = AsyncMock()
+
+    class FakeBuilder:
+        def update_queue(self, queue):
+            self.queue = queue
+            return self
+
+        def build(self):
+            return SimpleNamespace(update_queue=self.queue)
+
+    app = adapter._build_application_with_durable_ingress(FakeBuilder())
+    for update_id in (1, 2):
+        with pytest.raises(RuntimeError, match="controlled recovery failure"):
+            await app.update_queue.put(SimpleNamespace(update_id=update_id))
+
+    assert attempts == 2
+    assert app.update_queue.qsize() == 0
+    adapter._journal_update_before_polling_cursor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_gate_queues_recovered_input_before_execution_seal(monkeypatch):
+    """A restored row is sealed only when the drained turn can execute."""
+    import gateway.telegram_inbound_ledger as ledger
+
+    runner = object.__new__(GatewayRunner)
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    event = _event()
+    event._telegram_inbound_obligation_ids = ["oid-recovered"]
+
+    sealed = []
+    monkeypatch.setattr(
+        ledger,
+        "mark_execution_started",
+        lambda obligation_ids: sealed.append(list(obligation_ids)) or True,
+    )
+
+    assert await runner._handle_message(event) is None
+    assert runner._startup_restore_queue == [event]
+    assert sealed == []
+
+    class DrainedAtExecutionBoundary(RuntimeError):
+        pass
+
+    event._hermes_startup_restore_replay = True
+    runner._scale_to_zero_note_real_inbound = lambda: (_ for _ in ()).throw(
+        DrainedAtExecutionBoundary
+    )
+    with pytest.raises(DrainedAtExecutionBoundary):
+        await runner._handle_message(event)
+
+    assert sealed == [["oid-recovered"]]
+
+
+@pytest.mark.asyncio
+async def test_pre_polling_barrier_redelivers_before_recovering_inbound():
+    """The early polling barrier preserves the global recovery phase order."""
+    runner = object.__new__(GatewayRunner)
+    order = []
+    adapter = object()
+
+    async def redeliver(*, adapter_overrides=None):
+        assert adapter_overrides == {Platform.TELEGRAM: adapter}
+        order.append("delivery")
+        return 1
+
+    async def recover(*, adapter=None):
+        assert adapter is not None
+        order.append("inbound")
+        return 1
+
+    runner._redeliver_pending_obligations = redeliver
+    runner._recover_telegram_inbound_obligations = recover
+
+    assert await runner._prepare_telegram_polling_ingress(adapter) == 1
+    assert order == ["delivery", "inbound"]
+
+
+@pytest.mark.asyncio
 async def test_real_adapter_ingress_and_startup_sequence_dispatch_once_with_current_auth(
     tmp_path, monkeypatch
 ):
