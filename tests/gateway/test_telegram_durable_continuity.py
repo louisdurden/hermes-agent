@@ -97,6 +97,95 @@ async def test_accepted_telegram_input_recovers_once_through_adapter_and_startup
 
 
 @pytest.mark.asyncio
+async def test_polling_queue_journals_before_cursor_advance_and_recovers_once(
+    tmp_path, monkeypatch
+):
+    """PTB may advance its cursor only after the adapter's durable ingress write."""
+    import gateway.telegram_inbound_ledger as ledger
+
+    monkeypatch.setattr(ledger, "get_hermes_home", lambda: tmp_path)
+    event = _event()
+    adapter = _adapter()
+    adapter.config.extra = {"allow_from": ["42"]}
+    adapter._telegram_ingress_obligations = {}
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 60
+    adapter._text_batch_split_delay_seconds = 60
+    adapter._should_process_message = lambda message, *, is_command=False: True
+    adapter._build_message_event = lambda message, msg_type, update_id=None: event
+    adapter._clean_bot_trigger_text = lambda text: text
+    adapter._apply_telegram_group_observe_attribution = lambda built: built
+
+    message = SimpleNamespace(
+        text=event.text,
+        entities=[],
+        from_user=SimpleNamespace(id=42, username="canary", full_name="Canary"),
+        chat=SimpleNamespace(id=123, type="private", is_forum=False),
+        sender_chat=None,
+    )
+    update = SimpleNamespace(
+        update_id=event.platform_update_id,
+        message=message,
+        effective_message=message,
+    )
+
+    class FakeBuilder:
+        def update_queue(self, queue):
+            self.queue = queue
+            return self
+
+        def build(self):
+            return SimpleNamespace(update_queue=self.queue)
+
+    # This models PTB's polling loop: enqueue the update, then advance the
+    # in-memory cursor.  The application consumer is deliberately not started,
+    # so _handle_text_message can never run before the simulated process death.
+    app = adapter._build_application_with_durable_ingress(FakeBuilder())
+    fake_updater = SimpleNamespace(_last_update_id=None)
+    await app.update_queue.put(update)
+    fake_updater._last_update_id = update.update_id + 1
+
+    assert fake_updater._last_update_id == 9912
+    assert app.update_queue.qsize() == 1
+    with ledger._LOCK, ledger._transaction() as conn:
+        row = conn.execute(
+            "SELECT state, owner_pid FROM telegram_inbound_obligations"
+        ).fetchone()
+        assert row[0] == "accepted"
+        conn.execute(
+            "UPDATE telegram_inbound_obligations SET owner_pid=999999"
+        )
+
+    # Boot two has no queued PTB object, only the pre-cursor durable row. It
+    # reapplies current authorization, dispatches once, and boot three finds
+    # no replayable input.
+    recovered_adapter = _adapter()
+    recovered_adapter.config.extra = {"allow_from": ["42"]}
+    recovered_adapter._pending_text_batches = {}
+    recovered_adapter._pending_text_batch_tasks = {}
+    recovered_adapter._text_batch_delay_seconds = 0.001
+    recovered_adapter._text_batch_split_delay_seconds = 0.001
+    recovered_adapter.handle_message = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: recovered_adapter}
+    runner._adapter_profile_for_source = lambda source: None
+    runner._adapter_authorization_is_upstream = lambda platform, profile=None: False
+    runner.pairing_store = None
+    runner.pairing_stores = {}
+
+    with patch.object(ledger, "_owner_alive", return_value=False):
+        assert await runner._recover_telegram_inbound_obligations() == 1
+        await asyncio.sleep(0.02)
+        assert await runner._recover_telegram_inbound_obligations() == 0
+
+    recovered_adapter.handle_message.assert_awaited_once()
+    recovered = recovered_adapter.handle_message.await_args.args[0]
+    assert recovered.text == "durable canary input"
+    assert getattr(recovered, "_hermes_telegram_inbound_replay") is True
+
+
+@pytest.mark.asyncio
 async def test_real_adapter_ingress_and_startup_sequence_dispatch_once_with_current_auth(
     tmp_path, monkeypatch
 ):

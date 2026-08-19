@@ -598,6 +598,27 @@ _UPDATER_START_TIMEOUT = 30.0
 # one successful round trip. Unlike reconnect, initial bootstrap must fail closed
 # so GatewayRunner disposes the partial adapter and retries with a fresh PTB app.
 _INITIAL_POLLING_PROGRESS_TIMEOUT = 60.0
+
+
+class _DurableTelegramUpdateQueue(asyncio.Queue):
+    """Write accepted Telegram updates durably before PTB can advance offset.
+
+    PTB's polling loop advances ``_last_update_id`` immediately after awaiting
+    ``update_queue.put(update)``.  Application handlers run later in a separate
+    consumer task, so journaling in ``_handle_text_message`` leaves a crash gap.
+    This queue closes that gap by making the durable adapter ingress write part
+    of the enqueue acknowledgement itself.
+    """
+
+    def __init__(self, before_put):
+        super().__init__()
+        self._before_put = before_put
+
+    async def put(self, item):
+        await self._before_put(item)
+        await super().put(item)
+
+
 # shutdown()/initialize() on the getUpdates httpx request close and rebuild the
 # connection pool. When a connection is wedged on a stale CLOSE-WAIT socket that
 # close can block forever, hanging _drain_polling_connections() and freezing the
@@ -794,6 +815,10 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Polling queue ingress journals text before PTB advances its offset;
+        # handlers take the matching obligation from this process-local bridge.
+        # Durable ownership remains in state.db and survives if the bridge dies.
+        self._telegram_ingress_obligations: Dict[int, Dict[str, Any]] = {}
         self._drop_delayed_deliveries = False
         # Inbound events held across disconnect. PTB advances the polling offset
         # before our enqueue/flush drop-guard runs, so Telegram will not
@@ -4215,6 +4240,92 @@ class TelegramAdapter(BasePlatformAdapter):
             },
         }
 
+    async def _journal_update_before_polling_cursor(self, update) -> None:
+        """Persist accepted text while PTB still owns the polling cursor.
+
+        Non-text, unauthorized, and deliberately ignored group traffic passes
+        through without creating an agent obligation. Any persistence failure
+        for accepted text raises through ``update_queue.put`` so PTB cannot
+        advance the offset and silently lose the update.
+        """
+        msg = self._effective_update_message(update)
+        if not msg or not getattr(msg, "text", None):
+            return
+
+        entities = getattr(msg, "entities", None) or []
+        first_entity = entities[0] if entities else None
+        entity_type = getattr(first_entity, "type", None)
+        entity_type = getattr(entity_type, "value", entity_type)
+        is_command = bool(
+            first_entity
+            and getattr(first_entity, "offset", 0) == 0
+            and str(entity_type).lower() == "bot_command"
+        ) or str(msg.text).startswith("/")
+
+        if not self._is_user_authorized_from_message(msg):
+            return
+        if not self._should_process_message(msg, is_command=is_command):
+            return
+
+        message_type = MessageType.COMMAND if is_command else MessageType.TEXT
+        event = self._build_message_event(
+            msg, message_type, update_id=getattr(update, "update_id", None)
+        )
+        event.text = self._clean_bot_trigger_text(event.text) or ""
+        event = self._apply_telegram_group_observe_attribution(event)
+        setattr(event, "_hermes_telegram_batching", (
+            not is_command or len(event.text or "") >= self._SPLIT_THRESHOLD
+        ))
+        session_key = self._text_batch_key(event)
+        if not await self._journal_durable_text_event(event, session_key):
+            raise RuntimeError(
+                "Telegram durable ingress write failed before polling cursor advance"
+            )
+
+        update_id = getattr(update, "update_id", None)
+        if update_id is None:
+            raise RuntimeError("Telegram text update has no stable update_id")
+        bridge = getattr(self, "_telegram_ingress_obligations", None)
+        if bridge is None:
+            bridge = self._telegram_ingress_obligations = {}
+        bridge[int(update_id)] = {
+            "obligation_ids": list(
+                getattr(event, "_telegram_inbound_obligation_ids")
+            ),
+            "session_key": session_key,
+            "batching": bool(getattr(event, "_hermes_telegram_batching")),
+        }
+
+    def _attach_polling_ingress_obligation(
+        self, update, event: MessageEvent
+    ) -> Optional[str]:
+        """Move the pre-cursor obligation onto the handler's canonical event."""
+        update_id = getattr(update, "update_id", None)
+        bridge = getattr(self, "_telegram_ingress_obligations", {})
+        accepted = bridge.pop(int(update_id), None) if update_id is not None else None
+        if not accepted:
+            return None
+        setattr(
+            event,
+            "_telegram_inbound_obligation_ids",
+            list(accepted["obligation_ids"]),
+        )
+        setattr(event, "_hermes_telegram_batching", bool(accepted["batching"]))
+        return str(accepted["session_key"])
+
+    def _build_application_with_durable_ingress(self, builder):
+        """Build PTB with a queue that journals before polling offset advance."""
+        queue = _DurableTelegramUpdateQueue(
+            self._journal_update_before_polling_cursor
+        )
+        configure_queue = getattr(builder, "update_queue", None)
+        if configure_queue is not None:
+            # ApplicationBuilder mutates itself and returns ``self``. Ignore the
+            # return value so lightweight test doubles and mocks cannot replace
+            # the actual builder with an unconfigured chained mock.
+            configure_queue(queue)
+        return builder.build()
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app``.
 
@@ -4484,7 +4595,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
-            self._app = builder.build()
+            self._app = self._build_application_with_durable_ingress(builder)
             self._bot = self._app.bot
             
             # Register handlers via the single registration site (#64176).
@@ -4600,7 +4711,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # and will be GC'd (#67498).
                     if rebuild_app and _attempt < _max_connect - 1:
                         old_app = self._app
-                        self._app = builder.build()
+                        self._app = self._build_application_with_durable_ingress(builder)
                         self._bot = self._app.bot
                         # Keep core and observer handlers in lockstep after a
                         # transient-init rebuild (#64176).
@@ -9538,10 +9649,11 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        ingress_session_key = self._attach_polling_ingress_obligation(update, event)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        await self._accept_text_for_batch(event)
+        await self._accept_text_for_batch(event, ingress_session_key)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -9560,6 +9672,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        ingress_session_key = self._attach_polling_ingress_obligation(update, event)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -9573,9 +9686,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # before dispatch; short commands (/stop, /approve, ...) keep the
         # immediate path and are never delayed.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            await self._accept_text_for_batch(event)
+            await self._accept_text_for_batch(event, ingress_session_key)
             return
-        await self._dispatch_durable_text_event(event)
+        await self._dispatch_durable_text_event(event, ingress_session_key)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
