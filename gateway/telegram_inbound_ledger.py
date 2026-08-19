@@ -218,8 +218,14 @@ def mark_discarded(obligation_id: str | List[str]) -> bool:
         return False
 
 
-def claim_recoverable() -> List[Dict[str, Any]]:
-    """Atomically claim unstarted events left by a dead process."""
+def claim_recoverable(
+    profile_name: Optional[str] = None, *, match_profile: bool = False
+) -> List[Dict[str, Any]]:
+    """Atomically claim unstarted events left by a dead process.
+
+    ``match_profile`` confines multiplexed adapters to their own durable rows;
+    ``profile_name=None`` then denotes the primary/default profile.
+    """
     pid, started = _owner_stamp()
     now = time.time()
     claimed: List[Dict[str, Any]] = []
@@ -230,6 +236,11 @@ def claim_recoverable() -> List[Dict[str, Any]]:
             "ORDER BY created_at, obligation_id"
         ).fetchall()
         for oid, session_key, encoded, old_pid, old_started in rows:
+            payload = json.loads(encoded)
+            if match_profile:
+                row_profile = payload.get("source", {}).get("profile")
+                if row_profile != profile_name:
+                    continue
             # A second recovery sweep in the same live process must not steal
             # its own pre-execution claim. A later process can reclaim it only
             # after this owner has actually died.
@@ -245,7 +256,7 @@ def claim_recoverable() -> List[Dict[str, Any]]:
                 (pid, started, now, oid, old_pid, old_pid),
             )
             if cursor.rowcount:
-                claimed.append({"obligation_id": oid, "session_key": session_key, "payload": json.loads(encoded)})
+                claimed.append({"obligation_id": oid, "session_key": session_key, "payload": payload})
         conn.execute(
             "DELETE FROM telegram_inbound_obligations WHERE updated_at < ? AND state='executing'",
             (now - _RETENTION_SECONDS,),

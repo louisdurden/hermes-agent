@@ -11800,7 +11800,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
-    async def _redeliver_pending_obligations(self, adapter_overrides=None) -> int:
+    async def _redeliver_pending_obligations(
+        self,
+        adapter_overrides=None,
+        *,
+        session_profile: Optional[str] = None,
+        match_profile: bool = False,
+    ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -11838,7 +11844,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(p, "value", str(p)) for p in available_adapters
             }
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable,
+                None,
+                deliverable_platforms=_deliverable,
+                session_profile=session_profile,
+                match_profile=match_profile,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -11911,14 +11921,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
-    async def _prepare_telegram_polling_ingress(self, adapter) -> int:
+    def _arm_telegram_polling_ingress(
+        self, adapter, platform: Platform, *, profile_name: Optional[str] = None
+    ) -> None:
+        """Install profile-scoped durable recovery on every Telegram adapter."""
+        if platform != Platform.TELEGRAM:
+            return
+        set_ingress_barrier = getattr(
+            adapter, "set_before_polling_ingress_handler", None
+        )
+        if callable(set_ingress_barrier):
+            set_ingress_barrier(
+                lambda adapter=adapter, profile_name=profile_name: (
+                    self._prepare_telegram_polling_ingress(
+                        adapter,
+                        profile_name=profile_name,
+                        session_profile=(
+                            profile_name
+                            if profile_name is not None
+                            else self._active_profile_name()
+                        ),
+                    )
+                )
+            )
+
+    async def _prepare_telegram_polling_ingress(
+        self,
+        adapter,
+        *,
+        profile_name: Optional[str] = None,
+        session_profile: Optional[str] = None,
+    ) -> int:
         """Honor delivery-before-WAL recovery before the first new update."""
         await self._redeliver_pending_obligations(
-            adapter_overrides={Platform.TELEGRAM: adapter}
+            adapter_overrides={Platform.TELEGRAM: adapter},
+            session_profile=session_profile,
+            match_profile=True,
         )
-        return await self._recover_telegram_inbound_obligations(adapter=adapter)
+        return await self._recover_telegram_inbound_obligations(
+            adapter=adapter, profile_name=profile_name, match_profile=True
+        )
 
-    async def _recover_telegram_inbound_obligations(self, adapter=None) -> int:
+    async def _recover_telegram_inbound_obligations(
+        self,
+        adapter=None,
+        *,
+        profile_name: Optional[str] = None,
+        match_profile: bool = False,
+    ) -> int:
         """Dispatch once the Telegram inputs accepted before a dead startup.
 
         The inbound ledger claims rows before this method receives them. A
@@ -11937,7 +11987,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = adapter or self.adapters.get(Platform.TELEGRAM)
             if adapter is None:
                 return 0
-            rows = await asyncio.to_thread(claim_recoverable)
+            if match_profile:
+                rows = await asyncio.to_thread(
+                    claim_recoverable, profile_name, match_profile=True
+                )
+            else:
+                rows = await asyncio.to_thread(claim_recoverable)
         except Exception as exc:
             logger.exception("Telegram inbound recovery sweep failed")
             raise RuntimeError("Telegram inbound recovery sweep failed") from exc
@@ -11996,6 +12051,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ) from exc
         return dispatched
 
+    async def _recover_all_telegram_inbound_obligations(self) -> int:
+        """Replay each Telegram WAL row through its owning profile adapter."""
+        recovered = 0
+        primary = getattr(self, "adapters", {}).get(Platform.TELEGRAM)
+        if primary is not None:
+            recovered += await self._recover_telegram_inbound_obligations(
+                adapter=primary, profile_name=None, match_profile=True
+            )
+        for profile_name, profile_adapters in sorted(
+            getattr(self, "_profile_adapters", {}).items()
+        ):
+            adapter = profile_adapters.get(Platform.TELEGRAM)
+            if adapter is None:
+                continue
+            recovered += await self._recover_telegram_inbound_obligations(
+                adapter=adapter,
+                profile_name=profile_name,
+                match_profile=True,
+            )
+        return recovered
+
     async def _reconcile_startup_obligations(self) -> int:
         """Run the ordered durable startup handoff before generic auto-resume.
 
@@ -12005,7 +12081,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovery phase can take ownership of the same session.
         """
         await self._redeliver_pending_obligations()
-        recovered = await self._recover_telegram_inbound_obligations()
+        recovered = await self._recover_all_telegram_inbound_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
         return recovered
@@ -12723,16 +12799,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
-            if platform == Platform.TELEGRAM:
-                set_ingress_barrier = getattr(
-                    adapter, "set_before_polling_ingress_handler", None
-                )
-                if callable(set_ingress_barrier):
-                    set_ingress_barrier(
-                        lambda adapter=adapter: self._prepare_telegram_polling_ingress(
-                            adapter
-                        )
-                    )
+            self._arm_telegram_polling_ingress(adapter, platform)
             adapter._busy_text_mode = self._busy_text_mode
             _pending_connects.append((platform, platform_config, adapter))
 
@@ -14220,6 +14287,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
+                    self._arm_telegram_polling_ingress(adapter, platform)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -15310,6 +15378,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         adapter.set_platform_event_handler(
             self._make_profile_platform_event_handler(profile_name)
+        )
+        self._arm_telegram_polling_ingress(
+            adapter, platform, profile_name=profile_name
         )
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
         adapter._busy_text_mode = (

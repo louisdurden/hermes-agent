@@ -122,6 +122,25 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
+    def test_profile_scoped_sweep_does_not_steal_another_adapter_row(self):
+        _record(oid="main", session_key="agent:main:telegram:dm:1", platform="telegram")
+        _record(
+            oid="research",
+            session_key="agent:research:telegram:dm:1",
+            platform="telegram",
+        )
+        _orphan("main")
+        _orphan("research")
+
+        claimed = dl.sweep_recoverable(
+            deliverable_platforms={"telegram"},
+            session_profile="research",
+            match_profile=True,
+        )
+
+        assert [row["obligation_id"] for row in claimed] == ["research"]
+        assert _row("main")["attempts"] == 0
+
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):

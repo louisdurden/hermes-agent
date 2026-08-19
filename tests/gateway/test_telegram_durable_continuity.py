@@ -97,6 +97,41 @@ async def test_accepted_telegram_input_recovers_once_through_adapter_and_startup
 
 
 @pytest.mark.asyncio
+async def test_inbound_recovery_claims_only_the_owning_profile(tmp_path, monkeypatch):
+    """Multiplexed Telegram adapters cannot steal each other's WAL rows."""
+    import gateway.telegram_inbound_ledger as ledger
+
+    monkeypatch.setattr(ledger, "get_hermes_home", lambda: tmp_path)
+    primary = _event()
+    secondary = _event()
+    secondary.platform_update_id = 9912
+    secondary.message_id = "7789"
+    secondary.source.profile = "research"
+
+    assert ledger.record_accepted(
+        primary, "agent:main:telegram:dm:123"
+    )
+    assert ledger.record_accepted(
+        secondary, "agent:research:telegram:dm:123"
+    )
+    with ledger._LOCK, ledger._transaction() as conn:
+        conn.execute("UPDATE telegram_inbound_obligations SET owner_pid=999999")
+
+    with patch.object(ledger, "_owner_alive", return_value=False):
+        research_rows = ledger.claim_recoverable(
+            "research", match_profile=True
+        )
+        primary_rows = ledger.claim_recoverable(None, match_profile=True)
+
+    assert [row["payload"]["source"].get("profile") for row in research_rows] == [
+        "research"
+    ]
+    assert [row["payload"]["source"].get("profile") for row in primary_rows] == [
+        None
+    ]
+
+
+@pytest.mark.asyncio
 async def test_polling_queue_journals_before_cursor_advance_and_recovers_once(
     tmp_path, monkeypatch
 ):
@@ -289,13 +324,19 @@ async def test_pre_polling_barrier_redelivers_before_recovering_inbound():
     order = []
     adapter = object()
 
-    async def redeliver(*, adapter_overrides=None):
+    async def redeliver(
+        *, adapter_overrides=None, session_profile=None, match_profile=False
+    ):
         assert adapter_overrides == {Platform.TELEGRAM: adapter}
+        assert session_profile is None
+        assert match_profile is True
         order.append("delivery")
         return 1
 
-    async def recover(*, adapter=None):
+    async def recover(*, adapter=None, profile_name=None, match_profile=False):
         assert adapter is not None
+        assert profile_name is None
+        assert match_profile is True
         order.append("inbound")
         return 1
 
@@ -403,7 +444,7 @@ async def test_startup_obligation_reconciliation_fails_closed_before_resume():
     """An inbound recovery failure cannot fall through to generic auto-resume."""
     runner = object.__new__(GatewayRunner)
     runner._redeliver_pending_obligations = AsyncMock(return_value=0)
-    runner._recover_telegram_inbound_obligations = AsyncMock(
+    runner._recover_all_telegram_inbound_obligations = AsyncMock(
         side_effect=RuntimeError("controlled recovery failure")
     )
     scheduled = []

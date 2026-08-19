@@ -253,6 +253,8 @@ def sweep_recoverable(
     now: Optional[float] = None,
     *,
     deliverable_platforms: Optional[set] = None,
+    session_profile: Optional[str] = None,
+    match_profile: bool = False,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -283,6 +285,11 @@ def sweep_recoverable(
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at) in rows:
+            if match_profile:
+                parts = str(session_key).split(":", 2)
+                row_profile = parts[1] if len(parts) >= 3 and parts[0] == "agent" else None
+                if row_profile != session_profile:
+                    continue
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
