@@ -222,6 +222,76 @@ async def test_debounce_resets_timer_on_new_arrival():
 
 
 @pytest.mark.asyncio
+async def test_queue_mode_debounce_merges_every_telegram_obligation_id():
+    """A debounced Telegram follow-up remains one atomically sealable turn."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 10
+    first = _make_event("one")
+    second = _make_event("two")
+    first._telegram_inbound_obligation_ids = ["telegram-first"]
+    second._telegram_inbound_obligation_ids = ["telegram-second"]
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(first)
+    await adapter.handle_message(second)
+
+    assert _debounced_event(adapter, session_key)._telegram_inbound_obligation_ids == [
+        "telegram-first",
+        "telegram-second",
+    ]
+    await adapter._flush_text_debounce_now(session_key)
+    assert adapter._pending_messages[session_key]._telegram_inbound_obligation_ids == [
+        "telegram-first",
+        "telegram-second",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_new_reset_discard_debounce_only_after_terminal_ledger_transition(monkeypatch):
+    """The shared control-command discard path cannot leave recoverable input."""
+    adapter = _make_adapter()
+    adapter._busy_text_debounce_seconds = 10
+    event = _make_event("drop this pending reply")
+    event._telegram_inbound_obligation_ids = ["telegram-pending"]
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await adapter.handle_message(event)
+
+    discarded: list[list[str]] = []
+    monkeypatch.setattr(
+        "gateway.telegram_inbound_ledger.mark_discarded",
+        lambda ids: discarded.append(ids) or True,
+    )
+    assert adapter._discard_text_debounce(session_key)
+    assert discarded == [["telegram-pending"]]
+    assert session_key not in adapter._text_debounce
+
+
+@pytest.mark.asyncio
+async def test_stale_cleanup_retains_pending_input_when_terminal_transition_fails(monkeypatch):
+    """Fail closed: stale-lock healing may not drop an obligation it cannot close."""
+    adapter = _make_adapter()
+    event = _make_event("durable pending")
+    event._telegram_inbound_obligation_ids = ["telegram-pending"]
+    session_key = build_session_key(event.source)
+
+    async def _done():
+        return None
+
+    task = asyncio.create_task(_done())
+    await task
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = task
+    adapter._pending_messages[session_key] = event
+    monkeypatch.setattr("gateway.telegram_inbound_ledger.mark_discarded", lambda _ids: False)
+
+    assert not adapter._heal_stale_session_lock(session_key)
+    assert adapter._pending_messages[session_key] is event
+    assert session_key in adapter._active_sessions
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []
@@ -260,5 +330,3 @@ def test_command_messages_bypass_debounce_even_in_queue_mode():
     adapter = _make_adapter()
     assert not adapter._is_queue_text_debounce_candidate(_make_event(""))
     assert not adapter._is_queue_text_debounce_candidate(_make_event("/stop"))
-
-

@@ -36,6 +36,19 @@ def _make_adapter():
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter.handle_message = AsyncMock()
+
+    async def durable_dispatch(event, _session_key=None, *, hold_on_failure=True):
+        await adapter.handle_message(event)
+        return True
+
+    async def durable_journal(_event, _session_key=None):
+        return True
+
+    # These tests isolate command batching.  Model the successful durable
+    # handoff introduced for every accepted Telegram text input; durability
+    # failures and recovery live in test_telegram_durable_continuity.py.
+    adapter._dispatch_durable_text_event = durable_dispatch
+    adapter._journal_durable_text_event = durable_journal
     return adapter
 
 

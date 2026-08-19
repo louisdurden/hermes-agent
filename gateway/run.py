@@ -11907,6 +11907,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    async def _recover_telegram_inbound_obligations(self) -> int:
+        """Dispatch once the Telegram inputs accepted before a dead startup.
+
+        The inbound ledger claims rows before this method receives them. A
+        later process can reclaim an unstarted claim only after its owner has
+        died; execution-started rows are never replayed. This preserves
+        exactly-once execution without losing an item during recovery debounce.
+        """
+        try:
+            from gateway.config import Platform
+            from gateway.telegram_inbound_ledger import claim_recoverable, restore_event
+
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            if adapter is None:
+                return 0
+            rows = await asyncio.to_thread(claim_recoverable)
+        except Exception:
+            logger.debug("Telegram inbound recovery sweep failed", exc_info=True)
+            return 0
+
+        dispatched = 0
+        for row in rows:
+            try:
+                event = restore_event(row)
+                # Re-enter through Telegram's durable dispatcher.  The restored
+                # event carries the claimed obligation, so the dispatcher must
+                # preserve that claim instead of attempting a second INSERT.
+                # This keeps startup recovery and reconnect retries on one
+                # fail-closed path before the runner seals execution.
+                if getattr(event, "_hermes_telegram_batching", False):
+                    dispatched_now = await adapter._recover_durable_text_event(
+                        event, row["session_key"]
+                    )
+                else:
+                    dispatched_now = await adapter._dispatch_durable_text_event(
+                        event, row["session_key"]
+                    )
+                if not dispatched_now:
+                    continue
+                dispatched += 1
+                logger.info(
+                    "Recovered accepted Telegram input for session %s (obligation %s)",
+                    row["session_key"], row["obligation_id"],
+                )
+            except Exception:
+                # Keep the claimed row. Replaying it after an uncertain
+                # handoff would violate the no-duplicate execution contract.
+                logger.exception(
+                    "Telegram inbound recovery handoff failed for obligation %s; "
+                    "leaving it sealed to prevent duplicate execution",
+                    row.get("obligation_id"),
+                )
+        return dispatched
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -13016,6 +13070,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        # Telegram's polling offset advances before adapter dispatch. Recover
+        # accepted-but-unstarted input before generic session resumes so it
+        # enters through the ordinary adapter guard exactly once.
+        await self._recover_telegram_inbound_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -16248,6 +16306,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+
+        # The Telegram adapter journals accepted text before scheduling this
+        # runner path. Seal that journal at the first execution boundary. A
+        # crash after this point must not cause a later startup to replay an
+        # input whose agent work may already have started.
+        _telegram_inbound_obligation_ids = getattr(
+            event, "_telegram_inbound_obligation_ids", None
+        ) or [getattr(event, "_telegram_inbound_obligation_id", None)]
+        _telegram_inbound_obligation_ids = [
+            oid for oid in _telegram_inbound_obligation_ids if oid
+        ]
+        if _telegram_inbound_obligation_ids:
+            try:
+                from gateway.telegram_inbound_ledger import mark_execution_started
+
+                if not await asyncio.to_thread(
+                    mark_execution_started, _telegram_inbound_obligation_ids
+                ):
+                    logger.warning(
+                        "Refusing Telegram journalled input with unavailable execution claims %s",
+                        _telegram_inbound_obligation_ids,
+                    )
+                    return None
+            except Exception:
+                logger.warning(
+                    "Refusing Telegram journalled input because execution claim failed",
+                    exc_info=True,
+                )
+                return None
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -26415,8 +26502,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+        if adapter:
+            # /stop, /new, and /reset intentionally discard the previous
+            # turn's follow-up.  Telegram's accepted input has a restart
+            # recovery obligation, so use the adapter's terminal-discard
+            # funnel rather than popping it as an ordinary consumed turn.
+            discard_pending = getattr(adapter, "_discard_pending_message", None)
+            if callable(discard_pending):
+                discard_pending(session_key)
+            elif hasattr(adapter, "get_pending_message"):
+                adapter.get_pending_message(session_key)  # legacy adapters
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:

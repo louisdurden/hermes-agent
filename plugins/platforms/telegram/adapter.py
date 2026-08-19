@@ -1120,7 +1120,22 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     return
                 try:
-                    await self.handle_message(event)
+                    dispatched = await self._dispatch_durable_text_event(
+                        event, hold_on_failure=False
+                    )
+                    if not dispatched:
+                        # A failed journal attempt has not crossed the runner
+                        # boundary.  Re-hold it without an immediate retry;
+                        # retrying happens on the next reconnect/live hold.
+                        self._hold_inbound_event(
+                            event, where="redispatch-journal-failed", schedule=False
+                        )
+                        for rest in events[idx + 1 :]:
+                            self._hold_inbound_event(
+                                rest, where="redispatch-journal-failed", schedule=False
+                            )
+                        allow_followup_schedule = False
+                        return
                 except asyncio.CancelledError:
                     self._hold_inbound_event(
                         event, where="redispatch-cancelled", schedule=False
@@ -9526,7 +9541,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        await self._accept_text_for_batch(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -9558,9 +9573,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # before dispatch; short commands (/stop, /approve, ...) keep the
         # immediate path and are never delayed.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._accept_text_for_batch(event)
             return
-        await self.handle_message(event)
+        await self._dispatch_durable_text_event(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
@@ -9629,7 +9644,7 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(self, event: MessageEvent, session_key: Optional[str] = None) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -9641,17 +9656,24 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="text-enqueue")
             return
 
-        key = self._text_batch_key(event)
+        key = session_key or self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
+        obligation_ids = getattr(event, "_telegram_inbound_obligation_ids", None) or [
+            oid for oid in [getattr(event, "_telegram_inbound_obligation_id", None)] if oid
+        ]
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event._telegram_inbound_obligation_ids = list(obligation_ids)  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            existing._telegram_inbound_obligation_ids.extend(  # type: ignore[attr-defined]
+                obligation_ids
+            )
             # Merge any media that might be attached
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -9664,6 +9686,96 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    async def _journal_durable_text_event(
+        self, event: MessageEvent, session_key: Optional[str] = None
+    ) -> bool:
+        """Persist an accepted Telegram input, or fail closed before dispatch."""
+        # A debounce batch already has one durable obligation per accepted
+        # Telegram update.  Do not collapse that list at flush time: the
+        # runner must seal all fragments in one atomic transition so a restart
+        # cannot replay a suffix as an independent turn.
+        obligation_ids = getattr(event, "_telegram_inbound_obligation_ids", None)
+        if obligation_ids:
+            return True
+        if getattr(event, "_telegram_inbound_obligation_id", None):
+            event._telegram_inbound_obligation_ids = [event._telegram_inbound_obligation_id]  # type: ignore[attr-defined]
+            return True
+        if event.platform_update_id is None and event.message_id is None:
+            return True
+        try:
+            from gateway.session import build_session_key
+            from gateway.telegram_inbound_ledger import record_accepted
+
+            if session_key is None:
+                session_key = build_session_key(
+                    event.source,
+                    group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                    profile=event.source.profile,
+                )
+            obligation_id = await asyncio.to_thread(record_accepted, event, session_key)
+        except Exception:
+            obligation_id = None
+        if obligation_id:
+            event._telegram_inbound_obligation_ids = [obligation_id]  # type: ignore[attr-defined]
+            return True
+        return False
+
+    async def _accept_text_for_batch(
+        self, event: MessageEvent, session_key: Optional[str] = None
+    ) -> bool:
+        """Journal every text update before it can enter the debounce queue."""
+        # Topic recovery affects both the queue key and the session where a
+        # startup recovery must replay the persisted update. Resolve it before
+        # writing rather than only inside _enqueue_text_event.
+        session_key = session_key or self._text_batch_key(event)
+        event._hermes_telegram_batching = True  # type: ignore[attr-defined]
+        if not await self._journal_durable_text_event(event, session_key):
+            logger.error("[Telegram] Refusing accepted text batch because durable inbound journal failed")
+            self._hold_inbound_event(event, where="durable-inbound-journal")
+            return False
+        self._enqueue_text_event(event, session_key)
+        return True
+
+    async def _recover_durable_text_event(self, event: MessageEvent, session_key: str) -> bool:
+        """Restore a pre-flush batch item through its normal aggregation path."""
+        self._enqueue_text_event(event, session_key)
+        return True
+
+    async def _dispatch_durable_text_event(
+        self,
+        event: MessageEvent,
+        session_key: Optional[str] = None,
+        *,
+        hold_on_failure: bool = True,
+    ) -> bool:
+        """Journal accepted Telegram text before handing it to the runner.
+
+        PTB has already acknowledged the update by this point.  Do not let the
+        agent begin unless the recovery record reached the state DB; otherwise
+        a process death between offset advancement and dispatch is unrecoverable.
+        """
+        # Startup recovery restores an event with its already-claimed durable
+        # obligation.  It must re-enter through this dispatcher exactly once,
+        # without trying to INSERT the same update and then treating that
+        # deliberate duplicate rejection as a failed journal.
+        if getattr(event, "_hermes_telegram_inbound_replay", False):
+            await self.handle_message(event)
+            return True
+
+        # Adapter-generated Telegram updates always carry an update or message
+        # id.  Keep synthetic/test-only events without either identifier on the
+        # historical path: there is no stable deduplication key to journal.
+        if not await self._journal_durable_text_event(event, session_key):
+            logger.error(
+                "[Telegram] Refusing accepted text dispatch because durable inbound journal failed"
+            )
+            if hold_on_failure:
+                self._hold_inbound_event(event, where="durable-inbound-journal")
+            return False
+        await self.handle_message(event)
+        return True
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
@@ -9709,7 +9821,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            await self.handle_message(event)
+            await self._dispatch_durable_text_event(event, key)
             event = None
         except asyncio.CancelledError:
             # Cancelled after pop but before durable dispatch — hold, don't lose.

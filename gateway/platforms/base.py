@@ -2716,6 +2716,29 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        # Telegram journals each accepted inbound update before it reaches the
+        # adapter.  A busy-session merge makes several such updates one future
+        # turn, so that turn must retain every execution obligation.  Otherwise
+        # sealing the merged event would leave a consumed suffix ``accepted``
+        # and a restart could replay it as an independent turn.
+        existing_obligation_ids = getattr(existing, "_telegram_inbound_obligation_ids", None)
+        if not existing_obligation_ids:
+            existing_obligation_ids = [
+                getattr(existing, "_telegram_inbound_obligation_id", None)
+            ]
+        incoming_obligation_ids = getattr(event, "_telegram_inbound_obligation_ids", None)
+        if not incoming_obligation_ids:
+            incoming_obligation_ids = [
+                getattr(event, "_telegram_inbound_obligation_id", None)
+            ]
+        merged_obligation_ids = list(dict.fromkeys(
+            obligation_id
+            for obligation_id in [*existing_obligation_ids, *incoming_obligation_ids]
+            if obligation_id
+        ))
+        if merged_obligation_ids:
+            existing._telegram_inbound_obligation_ids = merged_obligation_ids
+
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -5627,6 +5650,39 @@ class BasePlatformAdapter(ABC):
         hard_cap_deadline = state.first_ts + self._busy_text_hard_cap_seconds
         return max(0.0, min(window_deadline, hard_cap_deadline) - now)
 
+    @staticmethod
+    def _telegram_inbound_obligation_ids(event: Optional[MessageEvent]) -> list[str]:
+        """Return the durable Telegram obligations attached to one event."""
+        if event is None:
+            return []
+        ids = getattr(event, "_telegram_inbound_obligation_ids", None)
+        if not ids:
+            ids = [getattr(event, "_telegram_inbound_obligation_id", None)]
+        return list(dict.fromkeys(str(oid) for oid in ids if oid))
+
+    def _discard_telegram_inbound_event(self, event: Optional[MessageEvent]) -> bool:
+        """Close an unstarted Telegram obligation before intentionally dropping it.
+
+        A failure retains the in-memory event rather than silently creating a
+        record that startup recovery can later revive as a separate turn.
+        """
+        obligation_ids = self._telegram_inbound_obligation_ids(event)
+        if not obligation_ids:
+            return True
+        try:
+            from gateway.telegram_inbound_ledger import mark_discarded
+
+            if mark_discarded(obligation_ids):
+                return True
+        except Exception:
+            pass
+        logger.warning(
+            "[%s] Retaining Telegram pending input because durable discard failed: %s",
+            self.name,
+            obligation_ids,
+        )
+        return False
+
     async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         store = self._text_debounce_store()
@@ -5671,6 +5727,12 @@ class BasePlatformAdapter(ABC):
                 state.event.message_id = str(latest_message_id)
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
+            existing_ids = self._telegram_inbound_obligation_ids(state.event)
+            incoming_ids = self._telegram_inbound_obligation_ids(event)
+            if incoming_ids:
+                state.event._telegram_inbound_obligation_ids = list(dict.fromkeys(
+                    [*existing_ids, *incoming_ids]
+                ))
             state.last_ts = now
 
         if state.task is not None and not state.task.done():
@@ -5722,11 +5784,24 @@ class BasePlatformAdapter(ABC):
         )
         return True
 
-    def _discard_text_debounce(self, session_key: str) -> None:
+    def _discard_text_debounce(self, session_key: str) -> bool:
         """Cancel and drop pending text debounce state for control commands."""
-        state = self._text_debounce_store().pop(session_key, None)
+        store = self._text_debounce_store()
+        state = store.get(session_key)
+        if state is not None and not self._discard_telegram_inbound_event(state.event):
+            return False
+        state = store.pop(session_key, None)
         if state is not None and state.task is not None and not state.task.done():
             state.task.cancel()
+        return True
+
+    def _discard_pending_message(self, session_key: str) -> bool:
+        """Remove a pending turn only after closing its durable input record."""
+        event = self._pending_messages.get(session_key)
+        if event is not None and not self._discard_telegram_inbound_event(event):
+            return False
+        self._pending_messages.pop(session_key, None)
+        return True
 
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
@@ -5794,10 +5869,15 @@ class BasePlatformAdapter(ABC):
             self.name,
             session_key,
         )
+        # If the durable terminal transition cannot be recorded, retain the
+        # stale state. Clearing only the in-memory copy would let a later
+        # startup recover a turn the operator intended to discard.
+        if not self._discard_pending_message(session_key):
+            return False
+        if not self._discard_text_debounce(session_key):
+            return False
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
-        self._discard_text_debounce(session_key)
         return True
 
     def _start_session_processing(
@@ -5878,7 +5958,7 @@ class BasePlatformAdapter(ABC):
                     exc_info=True,
                 )
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self._discard_pending_message(session_key)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
