@@ -1130,6 +1130,30 @@ class TestPrune:
                 "SELECT 1 FROM delivery_components WHERE turn_id='turn-old'"
             ).fetchone() is None
 
+    def test_old_discarded_inbound_is_pruned(self):
+        dl.record_inbound_turn(
+            turn_id="turn-discarded-old",
+            session_key="session",
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            payload={"text": "dropped"},
+        )
+        assert dl.mark_inbound_turns_discarded(["turn-discarded-old"])
+        old = time.time() - dl._RETENTION_SECONDS - 60
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE inbound_turns SET updated_at=? WHERE turn_id='turn-discarded-old'",
+                (old,),
+            )
+
+        dl._prune()
+
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM inbound_turns WHERE turn_id='turn-discarded-old'"
+            ).fetchone() is None
+
     def test_old_delivered_rows_pruned(self):
         _record()
         dl.mark_delivered("ob-1")

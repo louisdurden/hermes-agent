@@ -1492,7 +1492,7 @@ def _prune(now: Optional[float] = None) -> None:
                     (excess,),
                 )
             for table, id_column, terminal_states in (
-                ("inbound_turns", "turn_id", ("completed", "abandoned")),
+                ("inbound_turns", "turn_id", ("completed", "abandoned", "discarded")),
                 ("delivery_components", "component_id", ("delivered", "abandoned")),
                 ("post_delivery_effects", "effect_id", ("delivered", "abandoned")),
             ):
