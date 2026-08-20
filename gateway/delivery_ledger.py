@@ -961,7 +961,11 @@ def record_delivery_plan(
                 or turn_id not in represented
                 or any(
                     row[1] != session_key
-                    or row[2] not in {"received", "claimed"}
+                    # ``executing`` is sealed against inbound replay, but it
+                    # is still the live turn that is entitled to durably
+                    # record the response it just produced.  Completed and
+                    # discarded rows remain ineligible to create a plan.
+                    or row[2] not in {"received", "claimed", "executing"}
                     for row in rows
                 )
             ):
@@ -1031,7 +1035,7 @@ def record_delivery_plan(
                        SET state='completed', updated_at=?,
                            owner_pid=NULL, owner_started_at=NULL
                        WHERE turn_id IN ({placeholders})
-                         AND state IN ('received', 'claimed')""",
+                         AND state IN ('received', 'claimed', 'executing')""",
                 (now, *secondary_turn_ids),
             )
         stored_thread_id = str(thread_id) if thread_id else None

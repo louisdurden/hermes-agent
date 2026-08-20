@@ -99,6 +99,87 @@ class TestInboundTurnWal:
         assert state == "executing"
         assert dl.sweep_recoverable_inbound_turns() == []
 
+    def test_sealed_turn_can_persist_atomic_response_plan_and_effects(self):
+        turn_id = "telegram-sealed-response"
+        session_key = "agent:main:telegram:dm:C1"
+        assert dl.record_inbound_turn(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            payload={"text": "one"},
+        )
+        assert dl.mark_inbound_turns_executing([turn_id])
+
+        component_ids = dl.record_delivery_plan_with_post_delivery_effects(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            components=[{"kind": "text", "payload": {"content": "answer"}}],
+            post_delivery_effects=[{
+                "effect_key": "goal-status",
+                "kind": "goal_status_notice",
+                "payload": {"content": "Goal achieved"},
+            }],
+            represented_turn_ids=[turn_id],
+        )
+
+        assert len(component_ids) == 1
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone() == ("executing",)
+            assert conn.execute(
+                "SELECT effect_key FROM post_delivery_effects WHERE turn_id=?",
+                (turn_id,),
+            ).fetchall() == [("goal-status",)]
+        assert not dl.mark_inbound_turns_executing([turn_id])
+        assert dl.sweep_recoverable_inbound_turns() == []
+
+    @pytest.mark.parametrize("terminal_state", ["completed", "discarded"])
+    def test_response_plan_rejects_completed_or_discarded_turns(self, terminal_state):
+        turn_id = f"telegram-{terminal_state}-response"
+        session_key = "agent:main:telegram:dm:C1"
+        assert dl.record_inbound_turn(
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            payload={"text": terminal_state},
+        )
+        if terminal_state == "completed":
+            dl.mark_inbound_turn_completed(turn_id, session_key=session_key)
+        else:
+            assert dl.mark_inbound_turns_discarded([turn_id])
+
+        with pytest.raises(ValueError, match="session ownership mismatch"):
+            dl.record_delivery_plan_with_post_delivery_effects(
+                turn_id=turn_id,
+                session_key=session_key,
+                platform="telegram",
+                chat_id="C1",
+                thread_id=None,
+                components=[{"kind": "text", "payload": {"content": "unsafe"}}],
+                post_delivery_effects=[{
+                    "effect_key": "goal-status",
+                    "kind": "goal_status_notice",
+                    "payload": {"content": "unsafe"},
+                }],
+                represented_turn_ids=[turn_id],
+            )
+
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM delivery_components WHERE turn_id=?", (turn_id,)
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM post_delivery_effects WHERE turn_id=?", (turn_id,)
+            ).fetchone() == (0,)
+
     def test_intentional_discard_is_terminal_but_cannot_overwrite_execution(self):
         turn_id = "telegram-discarded"
         assert dl.record_inbound_turn(
