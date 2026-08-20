@@ -9651,7 +9651,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "auto_skill": event.auto_skill,
             "channel_prompt": event.channel_prompt,
             "channel_context": event.channel_context,
-            "allow_gateway_control": bool(event.allow_gateway_control),
             "internal": bool(event.internal),
             "timestamp": event.timestamp.isoformat(),
             "source": source.to_dict() if source is not None else None,
@@ -9819,7 +9818,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 auto_skill=payload.get("auto_skill"),
                 channel_prompt=payload.get("channel_prompt"),
                 channel_context=payload.get("channel_context"),
-                allow_gateway_control=bool(payload.get("allow_gateway_control", True)),
                 internal=bool(payload.get("internal")),
                 timestamp=timestamp,
                 metadata={
