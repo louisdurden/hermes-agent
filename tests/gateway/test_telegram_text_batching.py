@@ -78,6 +78,43 @@ class TestTextBatching:
         assert batch.metadata["_hermes_inbound_turn_ids"] == ["turn-1", "turn-2"]
 
     @pytest.mark.asyncio
+    async def test_teardown_during_wal_acceptance_discards_unenqueued_turn(
+        self, tmp_path, monkeypatch
+    ):
+        """A text accepted before teardown cannot be replayed after enqueue drops it."""
+        from gateway import delivery_ledger as dl
+
+        monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+        adapter = _make_adapter()
+        turn_id = "turn-dropped-during-teardown"
+
+        async def prepare(event, session_key):
+            dl.record_inbound_turn(
+                turn_id=turn_id,
+                session_key=session_key,
+                platform="telegram",
+                chat_id=event.source.chat_id,
+                thread_id=None,
+                payload={"text": event.text},
+            )
+            # Model teardown winning while the asynchronous WAL preflight is
+            # in flight; enqueue must now decline this already durable event.
+            adapter._mark_disconnected()
+            return turn_id
+
+        adapter.gateway_runner = SimpleNamespace(_prepare_inbound_turn=prepare)
+
+        accepted = await adapter._accept_text_for_batch(_make_event("late text"))
+
+        assert accepted is False
+        assert adapter._pending_text_batches == {}
+        with dl._connect() as conn:
+            state = conn.execute(
+                "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+        assert state == ("discarded",)
+
+    @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_adapter()
         event = _make_event("hello world")

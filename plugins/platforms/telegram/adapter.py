@@ -8820,7 +8820,7 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(self, event: MessageEvent) -> bool:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8830,7 +8830,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
-            return
+            self._discard_inbound_turns(event)
+            return False
 
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
@@ -8866,6 +8867,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+        return True
 
     async def _accept_text_for_batch(
         self, event: MessageEvent, *, dispatch_immediately: bool = False
@@ -8905,7 +8907,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if dispatch_immediately:
             await self.handle_message(event)
         else:
-            self._enqueue_text_event(event)
+            return self._enqueue_text_event(event)
         return True
 
     async def _flush_text_batch(self, key: str) -> None:

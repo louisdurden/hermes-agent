@@ -127,6 +127,39 @@ class TestCommandBypassActiveSession:
         assert any("handled:reset" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
+    async def test_cancellation_terminally_discards_pending_durable_turns(
+        self, tmp_path, monkeypatch
+    ):
+        """A cancelled queued follow-up must never be replayed after restart."""
+        state_db = tmp_path / "state.db"
+        monkeypatch.setattr(dl, "_db_path", lambda: state_db)
+        adapter = _make_adapter()
+        sk = _session_key()
+        turn_ids = ["turn-pending-primary", "turn-pending-followup"]
+        for turn_id in turn_ids:
+            dl.record_inbound_turn(
+                turn_id=turn_id,
+                session_key=sk,
+                platform="telegram",
+                chat_id="12345",
+                thread_id=None,
+                payload={"text": "queued follow-up"},
+            )
+        event = _make_event("queued follow-up")
+        event.metadata["_hermes_turn_id"] = turn_ids[0]
+        event.metadata["_hermes_inbound_turn_ids"] = turn_ids
+        adapter._pending_messages[sk] = event
+
+        await adapter.cancel_session_processing(sk)
+
+        assert sk not in adapter._pending_messages
+        with dl._connect() as conn:
+            states = conn.execute(
+                "SELECT turn_id, state FROM inbound_turns ORDER BY turn_id"
+            ).fetchall()
+        assert states == [(turn_ids[1], "discarded"), (turn_ids[0], "discarded")]
+
+    @pytest.mark.asyncio
     async def test_approve_bypasses_guard(self):
         """/approve must bypass (deadlock prevention)."""
         adapter = _make_adapter()
@@ -488,4 +521,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-
