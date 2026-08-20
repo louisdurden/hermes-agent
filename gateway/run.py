@@ -9635,6 +9635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self, "_continuity_session_aliases", {}
         ).get(session_key, session_key)
         source = event.source
+
         payload = {
             "text": event.text or "",
             "message_type": getattr(event.message_type, "value", str(event.message_type)),
@@ -9644,7 +9645,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "media_types": list(event.media_types or []),
             "reply_to_message_id": event.reply_to_message_id,
             "reply_to_text": event.reply_to_text,
+            "reply_to_author_id": event.reply_to_author_id,
+            "reply_to_author_name": event.reply_to_author_name,
+            "reply_to_is_own_message": bool(event.reply_to_is_own_message),
+            "auto_skill": event.auto_skill,
+            "channel_prompt": event.channel_prompt,
             "channel_context": event.channel_context,
+            "allow_gateway_control": bool(event.allow_gateway_control),
             "internal": bool(event.internal),
             "timestamp": event.timestamp.isoformat(),
             "source": source.to_dict() if source is not None else None,
@@ -9806,7 +9813,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_types=list(payload.get("media_types") or []),
                 reply_to_message_id=payload.get("reply_to_message_id"),
                 reply_to_text=payload.get("reply_to_text"),
+                reply_to_author_id=payload.get("reply_to_author_id"),
+                reply_to_author_name=payload.get("reply_to_author_name"),
+                reply_to_is_own_message=bool(payload.get("reply_to_is_own_message")),
+                auto_skill=payload.get("auto_skill"),
+                channel_prompt=payload.get("channel_prompt"),
                 channel_context=payload.get("channel_context"),
+                allow_gateway_control=bool(payload.get("allow_gateway_control", True)),
                 internal=bool(payload.get("internal")),
                 timestamp=timestamp,
                 metadata={
@@ -13503,6 +13516,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # Polling callbacks arrive before the profile handler runs.  Telegram
+        # needs this owner marker while accepting a text update into debounce.
+        adapter._hermes_secondary_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -14442,6 +14458,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+
+        # Text accepted by Telegram can sit in an in-memory debounce batch.
+        # Seal its WAL rows only when this logical turn reaches the runner;
+        # replaying after this point could duplicate tools or direct actions.
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            metadata = getattr(event, "metadata", None) or {}
+            turn_ids = list(metadata.get("_hermes_inbound_turn_ids") or [])
+            turn_id = metadata.get("_hermes_turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                turn_ids.append(turn_id)
+            turn_ids = list(dict.fromkeys(
+                value for value in turn_ids if isinstance(value, str) and value
+            ))
+            if turn_ids:
+                from gateway.delivery_ledger import mark_inbound_turns_executing
+                if not await asyncio.to_thread(mark_inbound_turns_executing, turn_ids):
+                    logger.warning("Refusing Telegram input without an execution seal: %s", turn_ids)
+                    return None
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning

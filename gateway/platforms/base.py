@@ -5452,11 +5452,18 @@ class BasePlatformAdapter(ABC):
         )
         return True
 
-    def _discard_text_debounce(self, session_key: str) -> None:
+    def _discard_text_debounce(self, session_key: str) -> bool:
         """Cancel and drop pending text debounce state for control commands."""
-        state = self._text_debounce_store().pop(session_key, None)
+        store = self._text_debounce_store()
+        state = store.get(session_key)
+        discard = getattr(self, "_discard_inbound_turns", None)
+        if state is not None and callable(discard) and not discard(state.event):
+            logger.warning("[%s] retaining debounce input after terminal discard failure", self.name)
+            return False
+        state = store.pop(session_key, None)
         if state is not None and state.task is not None and not state.task.done():
             state.task.cancel()
+        return True
 
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
@@ -5854,7 +5861,11 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
+                    if not self._discard_text_debounce(session_key):
+                        # Keep the recoverable input in place; advancing the
+                        # command handoff would make a failed terminal discard
+                        # look like an intentional loss.
+                        return
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
                     except Exception as e:

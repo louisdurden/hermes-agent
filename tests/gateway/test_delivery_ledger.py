@@ -81,6 +81,38 @@ class TestObligationId:
 
 
 class TestInboundTurnWal:
+    def test_execution_boundary_is_terminal_and_never_recovered(self):
+        turn_id = "telegram-executing"
+        assert dl.record_inbound_turn(
+            turn_id=turn_id,
+            session_key="agent:main:telegram:dm:C1",
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            payload={"text": "one"},
+        )
+        assert dl.mark_inbound_turns_executing([turn_id])
+        with dl._connect() as conn:
+            state = conn.execute(
+                "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+            ).fetchone()[0]
+        assert state == "executing"
+        assert dl.sweep_recoverable_inbound_turns() == []
+
+    def test_intentional_discard_is_terminal_but_cannot_overwrite_execution(self):
+        turn_id = "telegram-discarded"
+        assert dl.record_inbound_turn(
+            turn_id=turn_id,
+            session_key="agent:main:telegram:dm:C1",
+            platform="telegram",
+            chat_id="C1",
+            thread_id=None,
+            payload={"text": "drop"},
+        )
+        assert dl.mark_inbound_turns_discarded([turn_id])
+        assert not dl.mark_inbound_turns_executing([turn_id])
+        assert dl.sweep_recoverable_inbound_turns() == []
+
     def test_platform_redelivery_keeps_one_turn_id_when_timestamp_changes(self):
         first = {
             "text": "continue",
@@ -2235,4 +2267,3 @@ class TestPostDeliveryEffects:
 
         with pytest.raises(ValueError, match="post-delivery effect collision"):
             dl.record_post_delivery_effect(**{**kwargs, "payload": {"content": "different"}})
-
