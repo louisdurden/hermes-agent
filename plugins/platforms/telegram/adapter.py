@@ -8716,7 +8716,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        await self._accept_text_for_batch(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8748,9 +8748,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # before dispatch; short commands (/stop, /approve, ...) keep the
         # immediate path and are never delayed.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._accept_text_for_batch(event)
             return
-        await self.handle_message(event)
+        if await self._accept_text_for_batch(event, dispatch_immediately=True):
+            return
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
@@ -8819,7 +8820,7 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(self, event: MessageEvent) -> bool:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8829,7 +8830,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
-            return
+            self._discard_inbound_turns(event)
+            return False
 
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
@@ -8838,6 +8840,17 @@ class TelegramAdapter(BasePlatformAdapter):
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
+            existing_ids = list((getattr(existing, "metadata", None) or {}).get("_hermes_inbound_turn_ids") or [])
+            incoming_ids = list((getattr(event, "metadata", None) or {}).get("_hermes_inbound_turn_ids") or [])
+            for candidate in (
+                (getattr(existing, "metadata", None) or {}).get("_hermes_turn_id"),
+                (getattr(event, "metadata", None) or {}).get("_hermes_turn_id"),
+            ):
+                if isinstance(candidate, str) and candidate:
+                    incoming_ids.append(candidate)
+            merged_ids = list(dict.fromkeys([*existing_ids, *incoming_ids]))
+            if merged_ids:
+                existing.metadata["_hermes_inbound_turn_ids"] = merged_ids
             # Append text from the follow-up chunk
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
@@ -8854,6 +8867,48 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+        return True
+
+    async def _accept_text_for_batch(
+        self, event: MessageEvent, *, dispatch_immediately: bool = False
+    ) -> bool:
+        """Durably accept Telegram text before its debounce window.
+
+        Telegram advances its polling offset before this callback returns.  The
+        common inbound WAL therefore has to receive every update before an
+        in-memory batch can own it.  The aggregated event retains all turn IDs
+        so one real execution boundary seals every fragment atomically.
+        """
+        profile = getattr(self, "_hermes_secondary_profile_name", None)
+        if profile and not getattr(event.source, "profile", None):
+            event.source.profile = profile
+        runner = getattr(self, "gateway_runner", None)
+        if not getattr(event.source, "profile", None):
+            resolve_profile = getattr(runner, "_profile_name_for_source", None)
+            if callable(resolve_profile):
+                try:
+                    event.source.profile = resolve_profile(event.source) or None
+                except Exception:
+                    logger.debug("[Telegram] profile-route resolution failed before WAL ingress", exc_info=True)
+        key = self._text_batch_key(event)
+        event._hermes_telegram_batching = True  # type: ignore[attr-defined]
+        prepare = getattr(runner, "_prepare_inbound_turn", None)
+        if callable(prepare):
+            try:
+                result = prepare(event, key)
+                turn_id = await result if asyncio.iscoroutine(result) else result
+            except Exception:
+                logger.exception("[Telegram] refusing text batch: inbound WAL write failed")
+                return False
+            if turn_id:
+                event.metadata["_hermes_turn_id"] = turn_id
+            if event.metadata.get("_hermes_duplicate_inbound"):
+                return True
+        if dispatch_immediately:
+            await self.handle_message(event)
+        else:
+            return self._enqueue_text_event(event)
+        return True
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
@@ -8892,6 +8947,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             if self._should_drop_delayed_delivery():
                 logger.debug("[Telegram] Dropping text batch flush after disconnect started")
+                self._discard_inbound_turns(event)
                 return
             logger.info(
                 "[Telegram] Flushing text batch %s (%d chars)",
@@ -8901,6 +8957,23 @@ class TelegramAdapter(BasePlatformAdapter):
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+
+    @staticmethod
+    def _inbound_turn_ids(event: MessageEvent) -> list[str]:
+        metadata = getattr(event, "metadata", None) or {}
+        candidates = list(metadata.get("_hermes_inbound_turn_ids") or []) + [metadata.get("_hermes_turn_id")]
+        return list(dict.fromkeys(x for x in candidates if isinstance(x, str) and x))
+
+    def _discard_inbound_turns(self, event: MessageEvent) -> bool:
+        ids = self._inbound_turn_ids(event)
+        if not ids:
+            return True
+        try:
+            from gateway.delivery_ledger import mark_inbound_turns_discarded
+            return mark_inbound_turns_discarded(ids)
+        except Exception:
+            logger.exception("[Telegram] failed to terminally discard accepted text")
+            return False
 
     # ------------------------------------------------------------------
     # Photo batching

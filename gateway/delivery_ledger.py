@@ -421,6 +421,47 @@ def record_inbound_turn(
     return bool(inserted.rowcount)
 
 
+def mark_inbound_turns_executing(turn_ids: List[str]) -> bool:
+    """Cross the non-replayable execution boundary for accepted inputs.
+
+    Inbound rows are deliberately recoverable only until the gateway is about
+    to consume them.  A crash after this transition is ambiguous: replaying
+    could repeat tool or active-turn side effects, so the row stays terminal.
+    """
+    normalized = _normalized_turn_ids(turn_ids)
+    placeholders = ",".join("?" for _ in normalized)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT turn_id, state FROM inbound_turns WHERE turn_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        if len(rows) != len(normalized) or any(row[1] not in {"received", "claimed"} for row in rows):
+            return False
+        cursor = conn.execute(
+            f"UPDATE inbound_turns SET state='executing', updated_at=? WHERE turn_id IN ({placeholders})",
+            (time.time(), *normalized),
+        )
+    return cursor.rowcount == len(normalized)
+
+
+def mark_inbound_turns_discarded(turn_ids: List[str]) -> bool:
+    """Terminally close work intentionally dropped before execution."""
+    normalized = _normalized_turn_ids(turn_ids)
+    placeholders = ",".join("?" for _ in normalized)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT turn_id, state FROM inbound_turns WHERE turn_id IN ({placeholders})",
+            normalized,
+        ).fetchall()
+        if len(rows) != len(normalized) or any(row[1] not in {"received", "claimed"} for row in rows):
+            return False
+        cursor = conn.execute(
+            f"UPDATE inbound_turns SET state='discarded', owner_pid=NULL, owner_started_at=NULL, updated_at=? WHERE turn_id IN ({placeholders})",
+            (time.time(), *normalized),
+        )
+    return cursor.rowcount == len(normalized)
+
+
 def _normalized_turn_ids(turn_ids: List[str]) -> List[str]:
     normalized = list(dict.fromkeys(
         turn_id for turn_id in turn_ids
@@ -920,7 +961,11 @@ def record_delivery_plan(
                 or turn_id not in represented
                 or any(
                     row[1] != session_key
-                    or row[2] not in {"received", "claimed"}
+                    # ``executing`` is sealed against inbound replay, but it
+                    # is still the live turn that is entitled to durably
+                    # record the response it just produced.  Completed and
+                    # discarded rows remain ineligible to create a plan.
+                    or row[2] not in {"received", "claimed", "executing"}
                     for row in rows
                 )
             ):
@@ -990,7 +1035,7 @@ def record_delivery_plan(
                        SET state='completed', updated_at=?,
                            owner_pid=NULL, owner_started_at=NULL
                        WHERE turn_id IN ({placeholders})
-                         AND state IN ('received', 'claimed')""",
+                         AND state IN ('received', 'claimed', 'executing')""",
                 (now, *secondary_turn_ids),
             )
         stored_thread_id = str(thread_id) if thread_id else None
@@ -1447,7 +1492,7 @@ def _prune(now: Optional[float] = None) -> None:
                     (excess,),
                 )
             for table, id_column, terminal_states in (
-                ("inbound_turns", "turn_id", ("completed", "abandoned")),
+                ("inbound_turns", "turn_id", ("completed", "abandoned", "discarded")),
                 ("delivery_components", "component_id", ("delivered", "abandoned")),
                 ("post_delivery_effects", "effect_id", ("delivered", "abandoned")),
             ):

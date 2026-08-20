@@ -5452,11 +5452,42 @@ class BasePlatformAdapter(ABC):
         )
         return True
 
-    def _discard_text_debounce(self, session_key: str) -> None:
+    def _discard_text_debounce(self, session_key: str) -> bool:
         """Cancel and drop pending text debounce state for control commands."""
-        state = self._text_debounce_store().pop(session_key, None)
+        store = self._text_debounce_store()
+        state = store.get(session_key)
+        discard = getattr(self, "_discard_inbound_turns", None)
+        if state is not None and callable(discard) and not discard(state.event):
+            logger.warning("[%s] retaining debounce input after terminal discard failure", self.name)
+            return False
+        state = store.pop(session_key, None)
         if state is not None and state.task is not None and not state.task.done():
             state.task.cancel()
+        return True
+
+    @staticmethod
+    def _inbound_turn_ids(event: MessageEvent) -> List[str]:
+        """Return every durable inbound row represented by an event."""
+        metadata = getattr(event, "metadata", None) or {}
+        candidates = list(metadata.get("_hermes_inbound_turn_ids") or []) + [
+            metadata.get("_hermes_turn_id")
+        ]
+        return list(dict.fromkeys(
+            turn_id for turn_id in candidates if isinstance(turn_id, str) and turn_id
+        ))
+
+    def _discard_inbound_turns(self, event: MessageEvent) -> bool:
+        """Terminally close accepted inbound work intentionally not executed."""
+        turn_ids = self._inbound_turn_ids(event)
+        if not turn_ids:
+            return True
+        try:
+            from gateway.delivery_ledger import mark_inbound_turns_discarded
+
+            return mark_inbound_turns_discarded(turn_ids)
+        except Exception:
+            logger.exception("[%s] failed to terminally discard accepted input", self.name)
+            return False
 
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
@@ -5608,7 +5639,17 @@ class BasePlatformAdapter(ABC):
                     exc_info=True,
                 )
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            pending_event = self._pending_messages.get(session_key)
+            if pending_event is not None and not self._discard_inbound_turns(pending_event):
+                # Do not turn an unsuccessful terminal transition into an
+                # invisible loss.  Retaining the event preserves recoverable
+                # work instead of permitting a ghost replay after a pop.
+                logger.warning(
+                    "[%s] retaining pending input after terminal discard failure",
+                    self.name,
+                )
+            else:
+                self._pending_messages.pop(session_key, None)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -5854,7 +5895,11 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
+                    if not self._discard_text_debounce(session_key):
+                        # Keep the recoverable input in place; advancing the
+                        # command handoff would make a failed terminal discard
+                        # look like an intentional loss.
+                        return
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
                     except Exception as e:

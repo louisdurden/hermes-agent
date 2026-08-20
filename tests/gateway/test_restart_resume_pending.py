@@ -1683,6 +1683,59 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     assert runner._startup_restore_in_progress is False
 
 
+@pytest.mark.asyncio
+async def test_startup_restore_telegram_turn_is_admitted_once_after_drain(
+    tmp_path, monkeypatch
+):
+    """A durable Telegram turn stays recoverable until restore admits it."""
+    from gateway import delivery_ledger as dl
+
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "delivery.db")
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    admitted = MagicMock(return_value=True)
+    runner._is_duplicate_telegram_update = admitted
+
+    source = make_restart_source(chat_id="restore-durable-telegram")
+    event = MessageEvent(
+        text="hello after restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="restore-durable-message",
+    )
+    session_key = build_session_key(source)
+    turn_id = await runner._prepare_inbound_turn(event, session_key)
+    assert turn_id is not None
+
+    # Telegram's adapter has already completed durable intake before the
+    # runner's startup gate sees the event.  Deferral must not seal the turn.
+    await runner._handle_message(event)
+    with dl._connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+        ).fetchone() == ("received",)
+    assert runner._startup_restore_queue == [event]
+    admitted.assert_not_called()
+
+    async def admit_from_drain(queued_event):
+        await runner._handle_message(queued_event)
+
+    adapter.handle_message = AsyncMock(side_effect=admit_from_drain)
+    assert await runner._drain_startup_restore_queue() == 1
+
+    with dl._connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM inbound_turns WHERE turn_id=?", (turn_id,)
+        ).fetchone() == ("executing",)
+    admitted.assert_called_once_with(event)
+
+    # A second admission attempt cannot cross the execution boundary again.
+    await runner._handle_message(event)
+    admitted.assert_called_once()
+
+
 def test_stale_resume_candidate_releases_staged_inbound_for_one_replay():
     from gateway import delivery_ledger as dl
 
@@ -2072,5 +2125,4 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
 
