@@ -14457,24 +14457,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
-        # Text accepted by Telegram can sit in an in-memory debounce batch.
-        # Seal its WAL rows only when this logical turn reaches the runner;
-        # replaying after this point could duplicate tools or direct actions.
-        if getattr(source, "platform", None) == Platform.TELEGRAM:
-            metadata = getattr(event, "metadata", None) or {}
-            turn_ids = list(metadata.get("_hermes_inbound_turn_ids") or [])
-            turn_id = metadata.get("_hermes_turn_id")
-            if isinstance(turn_id, str) and turn_id:
-                turn_ids.append(turn_id)
-            turn_ids = list(dict.fromkeys(
-                value for value in turn_ids if isinstance(value, str) and value
-            ))
-            if turn_ids:
-                from gateway.delivery_ledger import mark_inbound_turns_executing
-                if not await asyncio.to_thread(mark_inbound_turns_executing, turn_ids):
-                    logger.warning("Refusing Telegram input without an execution seal: %s", turn_ids)
-                    return None
-
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -14522,6 +14504,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             self._queue_startup_restore_event(event)
             return None
+
+        # Text accepted by Telegram can sit in an in-memory debounce batch.
+        # Startup restore adds a second deferral boundary: its durable rows
+        # stay recoverable while the gate queues the event.  Seal only after
+        # the event has passed that gate and is being admitted to execution;
+        # replaying after this point could duplicate tools or direct actions.
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            metadata = getattr(event, "metadata", None) or {}
+            turn_ids = list(metadata.get("_hermes_inbound_turn_ids") or [])
+            turn_id = metadata.get("_hermes_turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                turn_ids.append(turn_id)
+            turn_ids = list(dict.fromkeys(
+                value for value in turn_ids if isinstance(value, str) and value
+            ))
+            if turn_ids:
+                from gateway.delivery_ledger import mark_inbound_turns_executing
+                if not await asyncio.to_thread(mark_inbound_turns_executing, turn_ids):
+                    logger.warning("Refusing Telegram input without an execution seal: %s", turn_ids)
+                    return None
 
         # Telegram update_id redelivery guard (FX-150/151, 2026-07-25). Real
         # risk under Mac-primary/Railway-failover: during the brief window
