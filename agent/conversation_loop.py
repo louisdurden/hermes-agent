@@ -1093,6 +1093,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    goa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1130,6 +1131,17 @@ def run_conversation(
             if _decoded_moa_config is not None:
                 user_message = _decoded_message
                 moa_config = _decoded_moa_config
+                if persist_user_message is None:
+                    persist_user_message = _decoded_message
+        except Exception:
+            pass
+    if goa_config is None:
+        try:
+            from hermes_cli.goa_config import decode_goa_turn
+            _decoded_message, _decoded_goa_config = decode_goa_turn(user_message)
+            if _decoded_goa_config is not None:
+                user_message = _decoded_message
+                goa_config = _decoded_goa_config
                 if persist_user_message is None:
                     persist_user_message = _decoded_message
         except Exception:
@@ -1226,6 +1238,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    goa_guidance: Optional[str] = None
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -1605,6 +1618,22 @@ def run_conversation(
                             break
             except Exception as _moa_exc:
                 logger.warning("MoA context aggregation failed: %s", _moa_exc)
+
+        if goa_config and goa_guidance is None:
+            try:
+                from agent.goa_loop import aggregate_goa_context
+                goa_guidance = aggregate_goa_context(
+                    user_prompt=original_user_message if isinstance(original_user_message, str) else "",
+                    config=goa_config,
+                )
+            except Exception as _goa_exc:
+                logger.warning("GoA context aggregation failed: %s", _goa_exc)
+                goa_guidance = "[Graph-of-Agents unavailable; proceed without GoA guidance.]"
+        if goa_guidance:
+            for _msg in reversed(api_messages):
+                if _msg.get("role") == "user" and isinstance(_msg.get("content"), str):
+                    _msg["content"] += "\n\n" + goa_guidance
+                    break
 
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
