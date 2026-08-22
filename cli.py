@@ -10057,6 +10057,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._pending_moa_disable_after_turn = True
             self._pending_agent_seed = payload
             _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
+        elif canonical == "goa":
+            parts = cmd_original.split(None, 1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            if not payload:
+                _cprint("  Usage: /goa <prompt>  (one opt-in profile graph turn)")
+                return True
+            from hermes_cli.goa_config import normalize_goa_config
+
+            self._pending_goa_config = normalize_goa_config(
+                self.config.get("goa") if isinstance(self.config, dict) else {}
+            )
+            self._pending_agent_seed = payload
+            _cprint("  GoA one-shot queued; normal routing resumes on the next turn.")
         elif canonical == "subgoal":
             self._handle_subgoal_command(cmd_original)
         elif canonical == "skin":
@@ -13641,6 +13654,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     agent_message = _prepend_note_to_message(agent_message, SPEECH_INTERRUPTED_NOTE)
                 _moa_cfg = getattr(self, "_pending_moa_config", None)
                 self._pending_moa_config = None
+                _goa_cfg = getattr(self, "_pending_goa_config", None)
+                self._pending_goa_config = None
                 if _moa_cfg is None:
                     _moa_cfg = None
                 # Model/skill notes and voice instructions are API-local. Keep
@@ -13662,6 +13677,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        goa_config=_goa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}

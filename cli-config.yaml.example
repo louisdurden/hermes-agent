@@ -7,6 +7,18 @@
 # =============================================================================
 # Database Configuration
 # =============================================================================
+goa:
+  # Profile Graph-of-Agents is off unless a frontend explicitly sends a /goa
+  # one-turn marker. It never replaces ordinary routing, Kanban, or MoA.
+  enabled: false
+  top_k: 3
+  rounds: 1
+  edge_threshold: 0.0
+  profiles: [fleetauthority, fleetcontent, fleetestetica, fleetfabric, fleetliterature, fleetoutreach, fleetpremium, fleetseo]
+  meta:
+    provider: openai-codex
+    model: gpt-5.6-sol
+    reasoning_effort: medium
 # WAL is the normal default. Hermes automatically falls back to DELETE when
 # SQLite reports that WAL is incompatible with the filesystem. Set this to
 # "delete" explicitly for deployments whose backing filesystem is not WAL
