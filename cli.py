@@ -10065,9 +10065,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return True
             from hermes_cli.goa_config import normalize_goa_config
 
-            self._pending_goa_config = normalize_goa_config(
+            goa_config = normalize_goa_config(
                 self.config.get("goa") if isinstance(self.config, dict) else {}
             )
+            if not goa_config["enabled"]:
+                _cprint(
+                    "  GoA está deshabilitado (goa.enabled: false en la config). "
+                    "Pedile a un operador que lo habilite si hace falta."
+                )
+                return True
+            self._pending_goa_config = goa_config
             self._pending_agent_seed = payload
             _cprint("  GoA one-shot queued; normal routing resumes on the next turn.")
         elif canonical == "subgoal":
