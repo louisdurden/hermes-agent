@@ -85,6 +85,73 @@ def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
 class TestRunJobScript:
     """Test the _run_job_script() function."""
 
+    def test_scheduler_repairs_missing_uv_home_before_python_child(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from hermes_cli import managed_uv, runtime_venv_preflight
+
+        venv = tmp_path / "venv"
+        venv.mkdir()
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {tmp_path / 'uv' / 'python' / 'cpython-3.11.15' / 'bin'}\n",
+            encoding="utf-8",
+        )
+        calls = []
+        monkeypatch.setattr(sched_mod.sys, "prefix", str(venv))
+        monkeypatch.setattr(managed_uv, "resolve_uv", lambda: "/managed/bin/uv")
+        monkeypatch.setattr(
+            runtime_venv_preflight,
+            "run_preflight",
+            lambda **kwargs: calls.append(kwargs) or {"status": "repaired"},
+        )
+
+        assert sched_mod._repair_missing_posix_venv_home() is None
+        assert calls == [
+            {
+                "venv": venv,
+                "uv": Path("/managed/bin/uv"),
+                "python_spec": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "timeout": 45.0,
+            }
+        ]
+
+    def test_python_script_runs_runtime_preflight_before_spawn(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        script = cron_env / "scripts" / "preflight.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(
+            sched_mod,
+            "_repair_missing_posix_venv_home",
+            lambda: calls.append("preflight") or None,
+        )
+
+        success, output = sched_mod._run_job_script(str(script))
+
+        assert success is True
+        assert output == "ok"
+        assert calls == ["preflight"]
+
+    def test_python_script_fails_closed_when_runtime_preflight_blocks(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        script = cron_env / "scripts" / "blocked.py"
+        script.write_text('print("must not run")\n', encoding="utf-8")
+        monkeypatch.setattr(
+            sched_mod,
+            "_repair_missing_posix_venv_home",
+            lambda: "runtime venv preflight blocked: uv-not-found",
+        )
+
+        success, output = sched_mod._run_job_script(str(script))
+
+        assert success is False
+        assert output == "runtime venv preflight blocked: uv-not-found"
+
     def test_successful_script(self, cron_env):
         from cron.scheduler import _run_job_script
 

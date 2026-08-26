@@ -4169,6 +4169,48 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _repair_missing_posix_venv_home() -> Optional[str]:
+    """Repair a rotated uv base before spawning a Python cron script.
+
+    The scheduler process can still be alive after uv removes the base path in
+    ``pyvenv.cfg``; the next ``sys.executable script.py`` cannot even import
+    ``encodings``.  Detect that narrow condition in-process and repair it with
+    uv before creating the child.  Healthy runtimes do no subprocess work.
+    """
+    if sys.platform == "win32":
+        return None
+
+    venv = Path(sys.prefix)
+    if not (venv / "pyvenv.cfg").is_file():
+        return None
+
+    from hermes_cli.runtime_venv_preflight import run_preflight, venv_home_missing
+
+    try:
+        missing = venv_home_missing(venv)
+    except (OSError, ValueError) as exc:
+        return f"runtime venv preflight blocked: {exc}"
+    if not missing:
+        return None
+
+    from hermes_cli.managed_uv import resolve_uv
+
+    uv_bin = resolve_uv() or shutil.which("uv")
+    if not uv_bin:
+        return "runtime venv preflight blocked: uv-not-found"
+
+    python_spec = f"{sys.version_info.major}.{sys.version_info.minor}"
+    result = run_preflight(
+        venv=venv,
+        uv=Path(uv_bin),
+        python_spec=python_spec,
+        timeout=45.0,
+    )
+    if result.get("status") not in {"healthy", "repaired"}:
+        return f"runtime venv preflight blocked: {result.get('reason', 'unknown')}"
+    return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4281,6 +4323,9 @@ def _run_job_script(
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
+        runtime_error = _repair_missing_posix_venv_home()
+        if runtime_error is not None:
+            return False, runtime_error
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         if env_overlay:
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
