@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -25,7 +26,9 @@ from agent.served_model import result_model_fields
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
 # real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+_VERIFICATION_CONTINUATION_FLAGS = (
+    "_verification_stop_synthetic", "_pre_verify_synthetic", "_pre_delivery_repair_synthetic",
+)
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -102,12 +105,19 @@ def _clone_background_review_messages(messages):
 
 
 def _invoke_hook_safely(name: str, logger: logging.Logger, **kwargs) -> list:
-    """Fire a lifecycle plugin hook; a failing hook is logged, never fatal."""
+    """Fire a lifecycle hook; delivery-gate dispatch failures fail closed."""
     try:
         from hermes_cli.lifecycle import invoke_hook
         return invoke_hook(name, **kwargs)
     except Exception as exc:
-        logger.warning("%s hook failed: %s", name, exc)
+        logger.warning("%s hook failed (%s)", name, type(exc).__name__)
+        if name == "pre_delivery":
+            from hermes_cli.plugins import PRE_DELIVERY_FAIL_CLOSED_MESSAGE
+            return [{
+                "action": "block",
+                "message": PRE_DELIVERY_FAIL_CLOSED_MESSAGE,
+                "reason": "dispatch_error",
+            }]
         return []
 
 
@@ -451,16 +461,32 @@ def _apply_output_hooks(
     agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
     messages,
 ) -> Tuple[Any, bool, Optional[Any]]:
-    """Resolve the turn's ``transform_llm_output`` outcome, then fire ``post_llm_call`` once per
-    turn after the tool loop. Returns ``(final_response, transformed, pre_transform_response)``.
+    """Fire ``transform_llm_output`` → ``pre_delivery`` → ``post_llm_call`` once per turn.
 
-    The transform itself normally already ran before the assistant row was first persisted
-    (``apply_llm_output_transform`` from ``finish_text_response`` / ``_persist_step``); this
-    call returns that recorded outcome, and only fires the hook here when no earlier seam saw a
-    response (e.g. text that only appeared through ``_explain_abnormal_exit``)."""
-    final_response, transformed, pre_transform = apply_llm_output_transform(
-        agent, final_response, turn_id=turn_id, platform=platform, logger=logger,
-    )
+    A stop-gate repair loop may already have transformed and approved the candidate. Reuse that
+    decision only while the bytes are unchanged; host-owned suffixes must pass the delivery gate
+    again, without repeating the earlier transform.
+    Returns ``(final_response, transformed, pre_transform_response)``."""
+    cached = getattr(agent, "_pre_delivery_output_cache", None)
+    if isinstance(cached, dict) and cached.get("response_text") == final_response:
+        transformed = bool(cached.get("transformed"))
+        pre_transform = cached.get("pre_transform")
+    else:
+        decision = _prepare_output_for_delivery(
+            agent, final_response, logger, platform=platform,
+            effective_task_id=effective_task_id, turn_id=turn_id,
+            original_user_message=original_user_message, messages=messages,
+            skip_transform=isinstance(cached, dict),
+        )
+        final_response = decision.response_text
+        transformed = decision.transformed or bool(
+            isinstance(cached, dict) and cached.get("transformed")
+        )
+        pre_transform = (
+            cached.get("pre_transform")
+            if isinstance(cached, dict) and cached.get("pre_transform") is not None
+            else decision.pre_transform_response
+        )
     # Detached forks are internal work and must not publish turns under the parent's session ID.
     if not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
@@ -517,6 +543,108 @@ def apply_llm_output_transform(
             break
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
     return final_response, transformed, pre_transform
+
+
+@dataclass(frozen=True)
+class PreDeliveryDecision:
+    """Normalized outcome of output transformation plus the mandatory delivery gate."""
+
+    action: str
+    response_text: Any
+    transformed: bool = False
+    pre_transform_response: Optional[Any] = None
+    reason: str = ""
+
+
+def _pre_delivery_reason_codes(reason: str) -> list[str]:
+    markers = {
+        "ledger visible": "missing_ledger",
+        "coloca primero la respuesta clínica": "missing_body",
+        "evidencia recuperada no cubre": "irrelevant_evidence",
+        "polaridad": "polarity_mismatch",
+        "eco de pregunta": "query_echo",
+        "cifras, citas o identificadores": "unsupported_specifics",
+        "afirmaciones sin respaldo": "unsupported_claims",
+        "No se recuperó evidencia": "missing_evidence",
+        "Falta el estado verificable": "missing_state",
+        "se limitó a abstenerse": "safe_degradation",
+    }
+    codes = [code for marker, code in markers.items() if marker.lower() in (reason or "").lower()]
+    return codes or ["policy_block"]
+
+
+def _prepare_output_for_delivery(
+    agent, response_text, logger, *, platform, effective_task_id, turn_id,
+    original_user_message, messages, skip_transform: bool = False,
+) -> PreDeliveryDecision:
+    """Transform and gate one candidate without publishing it.
+
+    Block wins over replacement across callbacks. The dispatcher has already normalized every
+    malformed/failed/timed-out callback into a block, so an empty result means no gate is installed.
+    """
+    def _record(decision: PreDeliveryDecision) -> PreDeliveryDecision:
+        from agent.clinical_trace import emit
+        emit(
+            agent,
+            "decision",
+            outcome=decision.action,
+            reason_codes=(
+                _pre_delivery_reason_codes(decision.reason)
+                if decision.action == "block"
+                else []
+            ),
+        )
+        return decision
+
+    transformed, pre_transform = False, None
+    if not skip_transform:
+        # La transformación vive en apply_llm_output_transform (idempotente por turn_id y
+        # normalmente ya aplicada antes de persistir); aquí solo se recupera su resultado.
+        response_text, transformed, pre_transform = apply_llm_output_transform(
+            agent, response_text, turn_id=turn_id, platform=platform, logger=logger,
+        )
+
+    directives = _invoke_hook_safely(
+        "pre_delivery", logger,
+        response_text=response_text,
+        session_id=agent.session_id or "",
+        task_id=effective_task_id,
+        turn_id=turn_id,
+        user_message=original_user_message,
+        conversation_history=list(messages),
+        model=agent.model,
+        platform=platform,
+    )
+    replacement = None
+    for directive in directives:
+        if not isinstance(directive, dict):
+            continue
+        if directive.get("action") == "block":
+            return _record(PreDeliveryDecision(
+                # Block messages are private policy metadata.  They must never become an
+                # assistant response; the owning runtime either repairs or fails silently.
+                action="block", response_text="",
+                transformed=transformed or isinstance(replacement, str),
+                pre_transform_response=(
+                    pre_transform if pre_transform is not None else (
+                        response_text if isinstance(replacement, str) else None
+                    )
+                ),
+                reason=str(directive.get("reason") or "policy_block"),
+            ))
+        if replacement is None and directive.get("action") == "replace":
+            replacement = directive.get("response_text")
+    if isinstance(replacement, str):
+        if pre_transform is None:
+            pre_transform = response_text
+        return _record(PreDeliveryDecision(
+            action="replace", response_text=replacement, transformed=True,
+            pre_transform_response=pre_transform,
+        ))
+    return _record(PreDeliveryDecision(
+        action="allow", response_text=response_text, transformed=transformed,
+        pre_transform_response=pre_transform,
+    ))
 
 
 def finalize_turn(
@@ -716,6 +844,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    from agent.clinical_trace import snapshot
+    if (delivery_trace := snapshot(agent)) is not None:
+        result["clinical_delivery_trace"] = delivery_trace
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway

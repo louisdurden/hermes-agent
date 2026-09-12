@@ -108,6 +108,16 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
             },
         ),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod(
+            "hermes_cli.tools_config",
+            _get_platform_tools=lambda config, platform: {"hermes-acp", "terminal", "web"}
+            if platform == "acp"
+            else set(),
+        ),
+    )
 
     manager = SessionManager(db=sentinel_db)
     agent = manager._make_agent(session_id="acp-session", cwd=".")
@@ -116,6 +126,7 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
     assert captured["session_id"] == "acp-session"
+    assert captured["enabled_toolsets"] == ["hermes-acp", "terminal", "web"]
 
 
 @pytest.mark.asyncio
@@ -210,6 +221,35 @@ async def test_acp_prompt_during_mutating_command_queues_then_runs():
         {"role": "assistant", "content": "ran: follow-up"},
     ]
     assert state.command_op is False
+async def test_acp_records_content_free_delivery_outcome(caplog):
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    original_run = fake.run_conversation
+
+    def traced_run(**kwargs):
+        result = original_run(**kwargs)
+        result["clinical_delivery_trace"] = {
+            "schema": 1,
+            "trace_id": "a" * 32,
+            "platform": "acp",
+            "protected": True,
+            "repair_count": 1,
+            "decision": "allow",
+        }
+        return result
+
+    fake.run_conversation = traced_run
+    with caplog.at_level("INFO", logger="hermes.clinical_delivery_trace"):
+        response = await acp_agent.prompt(
+            session_id=state.session_id,
+            prompt=[TextContentBlock(type="text", text="clinical request")],
+        )
+
+    assert response.stop_reason == "end_turn"
+    trace_lines = [record.message for record in caplog.records if record.message.startswith("clinical_delivery_trace ")]
+    assert len(trace_lines) == 1
+    assert '"event":"delivery"' in trace_lines[0]
+    assert '"outcome":"delivered"' in trace_lines[0]
+    assert "clinical request" not in trace_lines[0]
 
 
 
