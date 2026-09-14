@@ -38,6 +38,174 @@ logger = logging.getLogger("gateway.run")
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
+    _TELEGRAM_DEDUP_WINDOW_SECONDS = 600
+    _TELEGRAM_DEDUP_MAX_ENTRIES = 500
+
+    def _is_duplicate_telegram_update(self, event: MessageEvent) -> bool:
+        """Persistently reject a recently processed Telegram update id."""
+        source = getattr(event, "source", None)
+        update_id = getattr(event, "platform_update_id", None)
+        if update_id is None or getattr(getattr(source, "platform", None), "value", None) != "telegram":
+            return False
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / ".telegram_processed_updates.json"
+        now = time.time()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            data = {}
+        entries = data.get("entries", {}) if isinstance(data, dict) else {}
+        entries = {
+            key: stamp
+            for key, stamp in entries.items()
+            if isinstance(stamp, (int, float))
+            and now - stamp < self._TELEGRAM_DEDUP_WINDOW_SECONDS
+        }
+        key = str(update_id)
+        if key in entries:
+            return True
+        entries[key] = now
+        if len(entries) > self._TELEGRAM_DEDUP_MAX_ENTRIES:
+            entries = dict(
+                sorted(entries.items(), key=lambda item: item[1], reverse=True)[
+                    : self._TELEGRAM_DEDUP_MAX_ENTRIES
+                ]
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            temporary.replace(path)
+        except Exception:
+            logger.debug("failed to persist telegram update dedup store", exc_info=True)
+        return False
+
+    async def _prepare_inbound_turn(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Durably accept one normalized Telegram event before any debounce queue."""
+        from gateway.delivery_ledger import compute_inbound_turn_id, ledger_enabled, record_inbound_turn
+
+        if not ledger_enabled():
+            return None
+        source = getattr(event, "source", None)
+        if getattr(getattr(source, "platform", None), "value", None) != "telegram":
+            return None
+        assert source is not None
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = event.metadata = {}
+        turn_id = compute_inbound_turn_id(
+            platform="telegram",
+            chat_id=str(source.chat_id),
+            thread_id=str(source.thread_id) if source.thread_id else None,
+            message_id=event.message_id,
+            platform_update_id=event.platform_update_id,
+        )
+        payload = {
+            "text": event.text,
+            "message_type": event.message_type.value,
+            "user_id": event.user_id,
+            "user_name": event.user_name,
+            "message_id": event.message_id,
+            "ledger_message_id": event.ledger_message_id,
+            "platform_update_id": event.platform_update_id,
+            "media_urls": list(event.media_urls),
+            "media_types": list(event.media_types),
+            "media_text_inlined": list(event.media_text_inlined),
+            "reply_to_message_id": event.reply_to_message_id,
+            "reply_to_text": event.reply_to_text,
+            "reply_to_author_id": event.reply_to_author_id,
+            "reply_to_author_name": event.reply_to_author_name,
+            "reply_to_is_own_message": event.reply_to_is_own_message,
+            "prompt_response": event.prompt_response,
+            "auto_skill": event.auto_skill,
+            "channel_prompt": event.channel_prompt,
+            "channel_context": event.channel_context,
+            "internal": bool(event.internal),
+            "allow_gateway_control": bool(event.allow_gateway_control),
+            "timestamp": event.timestamp.isoformat(),
+            "source": source.to_dict(),
+        }
+        inserted = await asyncio.to_thread(
+            record_inbound_turn,
+            turn_id=turn_id,
+            session_key=session_key,
+            platform="telegram",
+            chat_id=str(source.chat_id),
+            thread_id=str(source.thread_id) if source.thread_id else None,
+            payload=payload,
+        )
+        if not inserted:
+            metadata["_hermes_duplicate_inbound"] = True
+            return None
+        metadata["_hermes_turn_id"] = turn_id
+        return turn_id
+
+    async def _recover_inbound_turns(self) -> int:
+        """Claim and redispatch accepted Telegram events left by dead gateways."""
+        from datetime import datetime
+
+        from gateway.delivery_ledger import release_inbound_turn_claim, sweep_recoverable_inbound_turns
+
+        platforms = {
+            getattr(platform, "value", str(platform))
+            for platform, adapter in getattr(self, "adapters", {}).items()
+            if adapter is not None
+        }
+        rows = await asyncio.to_thread(
+            sweep_recoverable_inbound_turns, deliverable_platforms=platforms
+        )
+        recovered = 0
+        for row in rows:
+            payload = row.get("payload") or {}
+            turn_id = str(row["turn_id"])
+            try:
+                source = SessionSource.from_dict(payload["source"])
+                timestamp = datetime.fromisoformat(payload["timestamp"])
+                event = MessageEvent(
+                    text=payload.get("text") or "",
+                    message_type=MessageType(payload.get("message_type", "text")),
+                    user_id=payload.get("user_id"),
+                    user_name=payload.get("user_name"),
+                    source=source,
+                    message_id=payload.get("message_id"),
+                    ledger_message_id=payload.get("ledger_message_id"),
+                    platform_update_id=payload.get("platform_update_id"),
+                    media_urls=list(payload.get("media_urls") or []),
+                    media_types=list(payload.get("media_types") or []),
+                    media_text_inlined=list(payload.get("media_text_inlined") or []),
+                    reply_to_message_id=payload.get("reply_to_message_id"),
+                    reply_to_text=payload.get("reply_to_text"),
+                    reply_to_author_id=payload.get("reply_to_author_id"),
+                    reply_to_author_name=payload.get("reply_to_author_name"),
+                    reply_to_is_own_message=bool(payload.get("reply_to_is_own_message")),
+                    prompt_response=payload.get("prompt_response"),
+                    auto_skill=payload.get("auto_skill"),
+                    channel_prompt=payload.get("channel_prompt"),
+                    channel_context=payload.get("channel_context"),
+                    internal=bool(payload.get("internal")),
+                    metadata={
+                        "_hermes_turn_id": turn_id,
+                        "_hermes_inbound_turn_ids": [turn_id],
+                        "_hermes_recovered_inbound": True,
+                    },
+                    timestamp=timestamp,
+                    allow_gateway_control=bool(payload.get("allow_gateway_control", True)),
+                )
+                setattr(event, "_hermes_startup_restore_replay", True)
+                adapter = self._adapter_for_source(source)  # type: ignore[attr-defined]
+                if adapter is None:
+                    raise RuntimeError("Telegram adapter unavailable")
+                await adapter.handle_message(event)
+                if not event._gateway_accepted:
+                    raise RuntimeError("Telegram adapter rejected recovered event")
+                recovered += 1
+            except Exception:
+                logger.warning("Recovered inbound %s was not scheduled; releasing claim", turn_id, exc_info=True)
+                await asyncio.to_thread(release_inbound_turn_claim, turn_id)
+        return recovered
+
     def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
@@ -1195,6 +1363,26 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            metadata = getattr(event, "metadata", None) or {}
+            turn_ids = list(metadata.get("_hermes_inbound_turn_ids") or [])
+            turn_id = metadata.get("_hermes_turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                turn_ids.append(turn_id)
+            turn_ids = list(dict.fromkeys(value for value in turn_ids if isinstance(value, str) and value))
+            if turn_ids:
+                from gateway.delivery_ledger import mark_inbound_turns_executing
+
+                sealed = await asyncio.to_thread(mark_inbound_turns_executing, turn_ids)
+                if not sealed:
+                    logger.warning("Refusing Telegram input without an execution seal: %s", turn_ids)
+                    return None
+            if not is_internal and self._is_duplicate_telegram_update(event):
+                logger.info(
+                    "Skipping redelivered Telegram update_id=%s (already processed)",
+                    event.platform_update_id,
+                )
+                return None
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,

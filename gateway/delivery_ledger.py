@@ -172,6 +172,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS inbound_turns (
+            turn_id TEXT PRIMARY KEY,
+            session_key TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT,
+            payload TEXT NOT NULL,
+            state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            last_error TEXT
+        )"""
+    )
 
 
 def _transaction():
@@ -191,6 +208,167 @@ def _start_time(pid: int) -> Optional[int]:
 def _owner_stamp() -> tuple[int, Optional[int]]:
     pid = os.getpid()
     return pid, _start_time(pid)
+
+
+def compute_inbound_turn_id(
+    *, platform: str, chat_id: str, thread_id: Optional[str], message_id: str,
+    platform_update_id: Optional[int] = None,
+) -> str:
+    """Return a stable identity for one platform-accepted inbound update."""
+    identity = platform_update_id if platform_update_id is not None else message_id
+    raw = f"{platform}|{chat_id}|{thread_id or ''}|{identity}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def record_inbound_turn(
+    *, turn_id: str, session_key: str, platform: str, chat_id: str,
+    thread_id: Optional[str], payload: Dict[str, Any], now: Optional[float] = None,
+) -> bool:
+    """Durably accept an inbound turn. False means its stable id already exists."""
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO inbound_turns
+               (turn_id, session_key, platform, chat_id, thread_id, payload, state,
+                attempts, created_at, updated_at, owner_pid, owner_started_at, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, 'received', 0, ?, ?, ?, ?, NULL)""",
+            (turn_id, session_key, platform, chat_id, thread_id, encoded,
+             now, now, pid, started),
+        )
+    return cursor.rowcount == 1
+
+
+def _normalized_turn_ids(turn_ids: List[str]) -> List[str]:
+    return list(dict.fromkeys(value for value in turn_ids if isinstance(value, str) and value))
+
+
+def mark_inbound_turns_executing(turn_ids: List[str], now: Optional[float] = None) -> bool:
+    """Atomically seal all represented rows immediately before execution."""
+    ids = _normalized_turn_ids(turn_ids)
+    if not ids:
+        return True
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    placeholders = ",".join("?" for _ in ids)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT turn_id, state, owner_pid, owner_started_at FROM inbound_turns WHERE turn_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        if len(rows) != len(ids) or any(
+            state not in {"received", "claimed"}
+            or (state == "claimed" and (owner_pid != pid or owner_started_at != started))
+            for _turn_id, state, owner_pid, owner_started_at in rows
+        ):
+            return False
+        cursor = conn.execute(
+            f"""UPDATE inbound_turns SET state='executing', updated_at=?,
+                   owner_pid=?, owner_started_at=?, last_error=NULL
+                   WHERE turn_id IN ({placeholders}) AND state IN ('received', 'claimed')""",
+            (now, pid, started, *ids),
+        )
+    return cursor.rowcount == len(ids)
+
+
+def mark_inbound_turns_discarded(turn_ids: List[str], now: Optional[float] = None) -> bool:
+    """Terminally discard accepted work, without overwriting an execution seal."""
+    ids = _normalized_turn_ids(turn_ids)
+    if not ids:
+        return True
+    now = now if now is not None else time.time()
+    placeholders = ",".join("?" for _ in ids)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT turn_id, state FROM inbound_turns WHERE turn_id IN ({placeholders})", ids,
+        ).fetchall()
+        if len(rows) != len(ids) or any(state not in {"received", "claimed", "discarded"} for _, state in rows):
+            return False
+        conn.execute(
+            f"""UPDATE inbound_turns SET state='discarded', updated_at=?,
+                   owner_pid=NULL, owner_started_at=NULL
+                   WHERE turn_id IN ({placeholders}) AND state IN ('received', 'claimed')""",
+            (now, *ids),
+        )
+    return True
+
+
+def mark_inbound_turns_completed(
+    turn_ids: List[str], *, session_key: str, now: Optional[float] = None,
+) -> bool:
+    ids = _normalized_turn_ids(turn_ids)
+    if not ids:
+        return True
+    now = now if now is not None else time.time()
+    placeholders = ",".join("?" for _ in ids)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"SELECT turn_id, session_key, state FROM inbound_turns WHERE turn_id IN ({placeholders})", ids,
+        ).fetchall()
+        if len(rows) != len(ids) or any(owner != session_key or state != "executing" for _, owner, state in rows):
+            return False
+        cursor = conn.execute(
+            f"""UPDATE inbound_turns SET state='completed', updated_at=?,
+                   owner_pid=NULL, owner_started_at=NULL
+                   WHERE turn_id IN ({placeholders}) AND session_key=? AND state='executing'""",
+            (now, *ids, session_key),
+        )
+    return cursor.rowcount == len(ids)
+
+
+def release_inbound_turn_claim(turn_id: str, error: str = "") -> bool:
+    """Return this process's unexecuted recovery claim to recoverable state."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE inbound_turns SET state='received', owner_pid=NULL,
+                      owner_started_at=NULL, last_error=?, updated_at=?
+               WHERE turn_id=? AND state='claimed' AND owner_pid IS ? AND owner_started_at IS ?""",
+            (error or None, time.time(), turn_id, pid, started),
+        )
+    return cursor.rowcount == 1
+
+
+def sweep_recoverable_inbound_turns(
+    now: Optional[float] = None, *, deliverable_platforms: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Claim dead/unowned accepted turns for one bounded startup replay."""
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT turn_id, session_key, platform, chat_id, thread_id, payload,
+                      state, attempts, created_at, owner_pid, owner_started_at
+               FROM inbound_turns WHERE state IN ('received', 'claimed') ORDER BY created_at"""
+        ).fetchall()
+        for turn_id, session_key, platform, chat_id, thread_id, payload, state, attempts, created_at, owner_pid, owner_started_at in rows:
+            if deliverable_platforms is not None and platform not in deliverable_platforms:
+                continue
+            if _owner_alive(owner_pid, owner_started_at):
+                continue
+            if attempts >= MAX_ATTEMPTS or now - created_at > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE inbound_turns SET state='abandoned', updated_at=?,
+                              owner_pid=NULL, owner_started_at=NULL
+                       WHERE turn_id=? AND state IN ('received', 'claimed')""",
+                    (now, turn_id),
+                )
+                continue
+            cursor = conn.execute(
+                """UPDATE inbound_turns SET state='claimed', attempts=attempts+1,
+                          updated_at=?, owner_pid=?, owner_started_at=?, last_error=NULL
+                   WHERE turn_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?""",
+                (now, pid, started, turn_id, state, owner_pid, owner_started_at),
+            )
+            if cursor.rowcount:
+                claimed.append({
+                    "turn_id": turn_id, "session_key": session_key, "platform": platform,
+                    "chat_id": chat_id, "thread_id": thread_id,
+                    "payload": json.loads(payload), "attempts": attempts + 1,
+                })
+    return claimed
 
 
 def _owner_alive(pid: Any, started_at: Any) -> bool:
@@ -484,6 +662,20 @@ def _prune(now: Optional[float] = None) -> None:
                                     ELSE 2
                                   END, updated_at ASC
                          LIMIT ?)""", (total - _MAX_ROWS,))
+            conn.execute(
+                """DELETE FROM inbound_turns
+                   WHERE state IN ('completed', 'abandoned', 'discarded') AND updated_at < ?""",
+                (now - _RETENTION_SECONDS,),
+            )
+            total_inbound = conn.execute("SELECT COUNT(*) FROM inbound_turns").fetchone()[0]
+            if total_inbound > _MAX_ROWS:
+                conn.execute(
+                    """DELETE FROM inbound_turns WHERE turn_id IN (
+                         SELECT turn_id FROM inbound_turns
+                         WHERE state IN ('completed', 'abandoned', 'discarded')
+                         ORDER BY updated_at ASC LIMIT ?)""",
+                    (total_inbound - _MAX_ROWS,),
+                )
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)
 
