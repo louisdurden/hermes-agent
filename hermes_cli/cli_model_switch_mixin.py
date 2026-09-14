@@ -865,3 +865,24 @@ class CLIModelSwitchMixin:
         self._pending_moa_disable_after_turn = True
         self._pending_agent_seed = payload
         _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
+
+    def _cmd_goa(self, cmd_original: str):
+        """Queue one Goal-oriented Agents turn when explicitly enabled."""
+        from cli import _cprint, _slash_args
+        from hermes_cli.goa_config import get_goa_config, goa_usage
+
+        payload = _slash_args(cmd_original)
+        if not payload:
+            _cprint(f"  {goa_usage()}")
+            return True
+
+        candidate_config = getattr(self, "config", None)
+        root_config = candidate_config if isinstance(candidate_config, dict) else {}
+        goa_cfg = get_goa_config(root_config)
+        if goa_cfg["enabled"] is not True:
+            _cprint("  GoA is disabled. Set goa.enabled: true to opt in.")
+            return True
+
+        self._pending_goa_config = goa_cfg
+        self._pending_agent_seed = payload
+        _cprint("  GoA one-shot queued.")

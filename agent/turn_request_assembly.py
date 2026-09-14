@@ -35,6 +35,7 @@ class AssembledRequest:
     approx_tokens: Any
     request_pressure_tokens: Any
     total_chars: Any
+    goa_guidance: Any
 
 
 def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original_user_message: Any) -> None:
@@ -83,6 +84,47 @@ def _append_moa_context(agent: Any, api_messages: Any, moa_config: Any, original
         logger.warning("MoA context aggregation failed: %s", _moa_exc)
 
 
+def append_goa_context(
+    api_messages: Any,
+    goa_config: Any,
+    original_user_message: Any,
+    existing_guidance: Any = None,
+) -> str:
+    """Append private GoA guidance to a request copy, generating it once per turn."""
+    if not isinstance(goa_config, dict) or goa_config.get("enabled") is not True:
+        return ""
+    try:
+        from agent.goa_loop import aggregate_guidance
+        from agent.message_content import flatten_message_text
+
+        guidance = existing_guidance or aggregate_guidance(
+            user_prompt=(
+                original_user_message
+                if isinstance(original_user_message, str)
+                else flatten_message_text(original_user_message)
+            ),
+            config=goa_config,
+        )
+        if not guidance:
+            return ""
+        for message in reversed(api_messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                message["content"] = content + "\n\n" + guidance
+            elif isinstance(content, list):
+                message["content"] = [
+                    *content,
+                    {"type": "text", "text": "\n\n" + guidance},
+                ]
+            break
+        return guidance
+    except Exception as exc:
+        logger.warning("GoA context aggregation failed: %s", exc)
+        return ""
+
+
 def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_request: Any) -> tuple:
     """Persistent-MoA request: rebase the pending prepared request onto the new messages
     when the client supports it, else prepare a fresh one. Returns
@@ -105,7 +147,8 @@ def _prepare_moa_request(agent: Any, api_messages: Any, pending_moa_prepared_req
 
 def assemble_api_request(
     agent: Any, *, messages: Any, current_turn_user_idx: Any, _ext_prefetch_cache: Any,
-    _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    _plugin_user_context: Any, moa_config: Any, goa_config: Any, goa_guidance: Any,
+    active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
 ) -> AssembledRequest:
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
@@ -125,6 +168,9 @@ def assemble_api_request(
 
     if moa_config:
         _append_moa_context(agent, api_messages, moa_config, original_user_message)
+    goa_guidance = append_goa_context(
+        api_messages, goa_config, original_user_message, goa_guidance
+    )
 
     # Ephemeral prefill messages go right after the system prompt, API-call-time only.
     if agent.prefill_messages:
@@ -258,4 +304,5 @@ def assemble_api_request(
     return AssembledRequest(
         "fallthrough", api_messages, tools_for_api, _moa_prepared_request,
         pending_moa_prepared_request, approx_tokens, request_pressure_tokens, approx_tokens * 4,
+        goa_guidance,
     )

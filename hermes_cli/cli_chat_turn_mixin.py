@@ -308,6 +308,8 @@ class CLIChatTurnMixin:
             agent_message = _prepend_note_to_message(agent_message, SPEECH_INTERRUPTED_NOTE)
         _moa_cfg = getattr(self, "_pending_moa_config", None)
         self._pending_moa_config = None
+        _goa_cfg = getattr(self, "_pending_goa_config", None)
+        self._pending_goa_config = None
         # Notes and voice prefix are API-local: the staged input stays the durable transcript
         # value so a close-path marker follows the same dict instead of a second user row.
         _persist_clean_user_message = message if (turn.voice_prefix or agent_message != message) else None
@@ -319,6 +321,7 @@ class CLIChatTurnMixin:
                 conversation_history=self.conversation_history[:-1],  # exclude the message just staged
                 stream_callback=turn.stream_callback, task_id=self.session_id,
                 persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
+                goa_config=_goa_cfg,
             )
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}

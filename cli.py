@@ -3196,6 +3196,7 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         "plugins": ("_cmd_plugins", True), "stop": ("_handle_stop_command", False),
         "agents": ("_handle_agents_command", False), "bg": ("_handle_background_command", True),
         "queue": ("_cmd_queue", True), "steer": ("_cmd_steer", True), "moa": ("_cmd_moa", True),
+        "goa": ("_cmd_goa", True),
     }
 
     @classmethod

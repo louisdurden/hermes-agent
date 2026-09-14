@@ -26,6 +26,7 @@ class TurnFacadeMixin:
         persist_user_timestamp: Optional[float]=None, persist_user_display_kind: Optional[str]=None,
         persist_user_display_metadata: Optional[Dict[str, Any]]=None,
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
+        goa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -136,6 +137,7 @@ class TurnFacadeMixin:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                        goa_config=goa_config,
                         turn_author=turn_author,
                     )
                 finally:

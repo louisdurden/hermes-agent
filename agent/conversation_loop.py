@@ -1253,6 +1253,21 @@ def _decode_inline_moa_turn(user_message, persist_user_message):
     return user_message, None, persist_user_message
 
 
+def _decode_inline_goa_turn(user_message, persist_user_message):
+    """Decode a transport-safe, one-turn GoA request without changing persistence."""
+    try:
+        from hermes_cli.goa_config import decode_goa_turn
+
+        decoded_message, decoded_config = decode_goa_turn(user_message)
+        if decoded_config is not None:
+            if persist_user_message is None:
+                persist_user_message = decoded_message
+            return decoded_message, decoded_config, persist_user_message
+    except Exception:
+        pass
+    return user_message, None, persist_user_message
+
+
 def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any]:
     """Typed recovery result when turn-start preflight compression timed out (#98424): no
     provider call was sent, and surfaces would otherwise hide the actionable guidance."""
@@ -1285,6 +1300,7 @@ class _LoopState:
     user_message: Any
     system_message: Any
     moa_config: Any
+    goa_config: Any
     original_user_message: Any
     conversation_history: Any
     effective_task_id: Any
@@ -1333,6 +1349,8 @@ class _LoopState:
     _pre_delivery_repair_attempts: int = 0
     # MoA guidance retained across a pre-API compression, rebased next iteration (no second fan-out).
     pending_moa_prepared_request: Any = None
+    # Private GoA guidance is generated once and rebased after pre-API compression.
+    goa_guidance: Any = None
     # Per-iteration slots.
     request_logger: Any = None
     api_messages: Any = None
@@ -1436,6 +1454,7 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    goa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1445,6 +1464,10 @@ def _run_conversation_turn(
     display-only event rendering; the model still receives the message unchanged."""
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
+            user_message, persist_user_message
+        )
+    if goa_config is None:
+        user_message, goa_config, persist_user_message = _decode_inline_goa_turn(
             user_message, persist_user_message
         )
 
@@ -1537,7 +1560,7 @@ def _run_conversation_turn(
     )
 
     s = _LoopState(
-        system_message=system_message, moa_config=moa_config,
+        system_message=system_message, moa_config=moa_config, goa_config=goa_config,
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
@@ -1622,6 +1645,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    goa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
@@ -1646,6 +1670,7 @@ def run_conversation(
         persist_user_display_metadata=persist_user_display_metadata,
         persist_user_platform_id=persist_user_platform_id,
         moa_config=moa_config,
+        goa_config=goa_config,
         turn_author=turn_author,
     )
     return export_current_turn_boundary(agent, result, user_message)
