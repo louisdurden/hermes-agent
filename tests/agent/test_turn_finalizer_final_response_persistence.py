@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from agent.turn_finalizer import finalize_turn
 
@@ -128,6 +129,44 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_transformed_delivery_is_persisted_once_as_delivered(monkeypatch):
+    """The durable assistant row must equal the post-hook delivery candidate."""
+    agent = FakeAgent()
+    agent._pre_delivery_output_cache = None
+    # Recovery path: no assistant row yet, so the tail close writes the transformed text
+    # (upstream applies the transform before the row exists; #44239).
+    messages = [{"role": "user", "content": "q"}]
+    calls = []
+
+    def invoke(name, _logger, **_kwargs):
+        calls.append(name)
+        if name == "transform_llm_output":
+            return ["transformed answer"]
+        return []
+
+    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke):
+        result = finalize_turn(
+            agent,
+            final_response="raw answer",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="q",
+            original_user_message="q",
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(final)",
+        )
+
+    assert calls.count("transform_llm_output") == 1
+    assert result["final_response"] == "transformed answer"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
@@ -479,3 +518,41 @@ def test_hard_failure_exit_reasons_still_fail_the_turn(monkeypatch):
     result = _finalize(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
     assert result["failed"] is True and result["completed"] is False
     assert result["failure_reason"] == "loop_error" and result["error"] == "stopped"
+
+
+def test_pre_delivery_replacement_rewrites_the_persisted_assistant_row():
+    """El gate corre DESPUÉS de que la fila del asistente existe: si reemplaza el texto,
+    lo persistido debe ser lo entregado, nunca el candidato original (PHI/clínico)."""
+    agent = FakeAgent()
+    agent._pre_delivery_output_cache = None
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "unsafe candidate"},
+    ]
+
+    def invoke(name, _logger, **_kwargs):
+        if name == "pre_delivery":
+            return [{"action": "replace", "response_text": "safe degradation"}]
+        return []
+
+    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke):
+        result = finalize_turn(
+            agent,
+            final_response="unsafe candidate",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="q",
+            original_user_message="q",
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(final)",
+        )
+
+    assert result["final_response"] == "safe degradation"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == "safe degradation"
+    assert all("unsafe candidate" not in str(m.get("content")) for m in agent.persisted_messages)
