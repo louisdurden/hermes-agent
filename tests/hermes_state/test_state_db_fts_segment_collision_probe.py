@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_state_holders
 from hermes_state import SessionDB
 from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
@@ -63,10 +64,18 @@ def test_write_probe_reports_segment_collision_that_integrity_check_misses(tmp_p
     assert sqlite3.connect(str(db_path)).execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
 
 
-def test_repair_heals_segment_collision_and_restores_appends(tmp_path):
+def test_repair_heals_segment_collision_and_restores_appends(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     sid = _build_db_with_trigram(db_path)
     _plant_stale_trigram_segment(db_path)
+
+    # Exercise collision repair without depending on unrelated OS-wide process churn.
+    # The real SQLite exclusive-lock admission probe below this seam remains active.
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "foreign_state_db_holders",
+        lambda _path: [],
+    )
 
     report = repair_state_db_schema(db_path, backup=False)
     assert report.get("repaired"), report

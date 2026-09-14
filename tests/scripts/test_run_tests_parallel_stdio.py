@@ -25,6 +25,16 @@ def _load_runner():
     return mod
 
 
+def test_voice_cli_integration_is_quarantined_from_parallel_processes():
+    runner = _load_runner()
+
+    voice_file = REPO_ROOT / "tests" / "tools" / "test_voice_cli_integration.py"
+    ordinary_file = REPO_ROOT / "tests" / "tools" / "test_mcp_oauth.py"
+
+    assert runner._requires_serial_execution(voice_file, REPO_ROOT)
+    assert not runner._requires_serial_execution(ordinary_file, REPO_ROOT)
+
+
 def _cp1252_stream() -> tuple[io.TextIOWrapper, io.BytesIO]:
     raw = io.BytesIO()
     return io.TextIOWrapper(raw, encoding="cp1252", errors="strict"), raw

@@ -68,11 +68,11 @@ async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monk
     try:
         await asyncio.sleep(.15)
         assert load_state()["run_count"] == 0
-        set_paused(False)
         # Active turns must suppress maintenance even with a zero idle threshold.
         import tui_gateway.server as gateway
         with gateway._sessions_lock:
             gateway._sessions['maintenance-test'] = {"running": True}
+        set_paused(False)
         try:
             await asyncio.sleep(.15)
             assert load_state()["run_count"] == 0
