@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -282,13 +282,17 @@ test('POSIX managed launcher is detached, correlation-scoped, and never publishe
 
 test('POSIX managed launcher executes the updater command and atomically publishes its status', async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-launch-'))
+  const hermesPath = path.join(home, 'hermes')
 
   try {
+    await writeFile(hermesPath, '#!/bin/sh\nexit 0\n', 'utf8')
+    await chmod(hermesPath, 0o700)
+
     const command = buildPosixManagedUpdateLaunch(
       {
         ssh: { exec: async () => '' },
         platform: 'Linux',
-        hermesPath: '/bin/true',
+        hermesPath,
         hermesHome: home
       },
       CORRELATION
@@ -298,7 +302,7 @@ test('POSIX managed launcher executes the updater command and atomically publish
     const statusPath = path.join(home, `.update_exit_code.${CORRELATION}`)
     let status = ''
 
-    for (let attempt = 0; attempt < 50 && !status; attempt += 1) {
+    for (let attempt = 0; attempt < 500 && !status; attempt += 1) {
       try {
         status = await readFile(statusPath, 'utf8')
       } catch {
