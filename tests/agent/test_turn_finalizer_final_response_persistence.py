@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from agent.turn_finalizer import finalize_turn
 
@@ -128,6 +129,45 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_transformed_delivery_is_persisted_once_as_delivered(monkeypatch):
+    """The durable assistant row must equal the post-hook delivery candidate."""
+    agent = FakeAgent()
+    agent._pre_delivery_output_cache = None
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "raw answer"},
+    ]
+    calls = []
+
+    def invoke(name, _logger, **_kwargs):
+        calls.append(name)
+        if name == "transform_llm_output":
+            return ["transformed answer"]
+        return []
+
+    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke):
+        result = finalize_turn(
+            agent,
+            final_response="raw answer",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="q",
+            original_user_message="q",
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(final)",
+        )
+
+    assert calls.count("transform_llm_output") == 1
+    assert result["final_response"] == "transformed answer"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(

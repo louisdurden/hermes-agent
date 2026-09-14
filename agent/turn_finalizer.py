@@ -454,6 +454,28 @@ def _apply_output_hooks(
     return final_response, transformed, pre_transform
 
 
+def _sync_delivered_response_to_transcript(
+    agent, messages, *, prior_response, delivered_response,
+) -> None:
+    """Keep the current-turn assistant row aligned with delivered bytes."""
+    if prior_response == delivered_response:
+        return
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            break
+        if (
+            message.get("role") == "assistant"
+            and flatten_message_text(message.get("content")) == (prior_response or "")
+        ):
+            message["content"] = delivered_response or ""
+            message.pop("_db_persisted", None)
+            if hasattr(agent, "_db_flush_scan_prefix"):
+                agent._db_flush_scan_prefix = None
+            return
+
+
 @dataclass(frozen=True)
 class PreDeliveryDecision:
     """Normalized outcome of output transformation plus the mandatory delivery gate."""
@@ -603,8 +625,10 @@ def finalize_turn(
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
+    _persistence_prepared = False
+
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, _persistence_prepared
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -612,14 +636,10 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
-        agent._persist_session(messages, conversation_history)
+        _persistence_prepared = True
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
-
-    # Keep the gateway's separate in-memory history snapshot current even on
-    # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
-    with suppress(Exception):
-        agent._session_messages = messages
+    _transcript_final_response = final_response
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
@@ -640,6 +660,29 @@ def finalize_turn(
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
         )
 
+    # Surrogate chokepoint: sanitize before both durable storage and external delivery.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
+    _sync_delivered_response_to_transcript(
+        agent,
+        messages,
+        prior_response=_transcript_final_response,
+        delivered_response=final_response,
+    )
+    if _persistence_prepared:
+        _guarded_cleanup(
+            "persist_session",
+            lambda: agent._persist_session(messages, conversation_history),
+            _cleanup_errors,
+            logger,
+        )
+
+    # Keep the gateway's separate in-memory history snapshot current even on
+    # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
+    with suppress(Exception):
+        agent._session_messages = messages
+
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
@@ -652,17 +695,6 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
-
-    # Surrogate chokepoint: RAW SDK text with a lone UTF-16 surrogate crashes downstream
-    # consumers (stdout, Telegram ``utf16_len``, JSON); scrub once where it leaves the loop.
-    # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819): ``final_response`` is often the RAW
-    # SDK content (``assistant_message.content``), not the sanitized copy stored in history by
-    # ``build_assistant_message``. Any lone UTF-16 surrogate (U+D800–U+DFFF) in it crashes downstream
-    # consumers — oneshot stdout writes, Telegram's ``utf16_len`` length check, Signal formatting, JSON
-    # envelope encodes — on every provider (Ollama, NVIDIA NIM, …). Scrub once here, where model text leaves
-    # the conversation loop, so every delivery surface receives valid Unicode.
-    if isinstance(final_response, str):
-        final_response = _sanitize_surrogates(final_response)
 
     result = {
         "final_response": final_response,
