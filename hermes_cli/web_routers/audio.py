@@ -516,3 +516,42 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         pump.cancel()
         with contextlib.suppress(Exception):
             await ws.close()
+
+
+@router.websocket("/api/voice/gemini-live")
+async def gemini_live_ws(ws: "WebSocket") -> None:
+    """Bridge an authenticated local voice socket to Gemini Live."""
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    profile = (ws.query_params.get("profile") or "").strip() or None
+    with _config_profile_scope(profile):
+        api_key = (load_env().get("GEMINI_API_KEY") or "").strip()
+    if not api_key and profile is None:
+        api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+    await ws.accept()
+    if not api_key:
+        with contextlib.suppress(Exception):
+            await ws.send_json(
+                {"type": "bridge_error", "error": "GEMINI_API_KEY no configurada"}
+            )
+            await ws.close(code=4404)
+        return
+
+    from agent.gemini_live_bridge import GeminiLiveSession
+
+    try:
+        await GeminiLiveSession(api_key).run(ws)
+    except WebSocketDisconnect:
+        _log.debug("Gemini Live client disconnected")
+    except Exception:
+        _log.exception("Gemini Live bridge failed")
+        raise
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
