@@ -58,6 +58,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/refine [focus]` | Run the background memory/skill self-improvement review **now** instead of waiting for the automatic post-turn trigger. Optional focus text steers the review (e.g. `/refine save the deploy workflow as a skill`). Runs in a background fork against a conversation snapshot — the live session and prompt cache are untouched; results are reported when done. |
 | `/review [instructions]` | Spawn an independent, full-privilege reviewer subagent to review the work just discussed — a PR, code, docs, any artifact referenced in the last 10 chat messages. It investigates in the background (opens the PR, reads the diff, runs code) and its full review re-enters this session as a background-subagent completion the primary agent can act on. Pin a dedicated review model via `auxiliary.review` in config.yaml (defaults to your main model). See [Subagent Delegation](/user-guide/features/delegation#the-review-command). |
 | `/moa <prompt>` | Run a single prompt through the default [Mixture of Agents](/user-guide/features/mixture-of-agents) preset, then restore your current model. One-shot — does not change your session model. |
+| `/goa <prompt>` | Run one prompt through Goal-oriented Agents when `goa.enabled` is explicitly enabled; disabled by default. |
 | `/resume [name]` | Resume a previously-named session |
 | `/sessions` (TUI alias: `/switch`) | Classic CLI: browse and resume previous sessions in an interactive picker. TUI: open the live session switcher for currently open TUI sessions. Use `/sessions new` in the TUI to start another live session immediately. |
 | `/egress [status]` | Show Docker egress proxy status — enabled/configured/running state, credential source, token mappings, uncovered providers, and next remediation step. Works in CLI, TUI, Desktop chat, and messaging gateway. |
@@ -277,6 +278,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/refine [focus]` | Run the memory/skill self-improvement review now, optionally with focus instructions. On Slack use `/hermes refine …`. |
 | `/review [instructions]` | Spawn an independent reviewer subagent for the work just discussed (PR, code, docs); its review re-enters this chat when done. On Slack use `/hermes review …`. |
 | `/moa <prompt>` | Run one prompt through the default [Mixture of Agents](/user-guide/features/mixture-of-agents) preset, then restore the session model. |
+| `/goa <prompt>` | Run one prompt through Goal-oriented Agents when `goa.enabled` is explicitly enabled. On Slack use `/hermes goa …`. |
 | `/branch [name]` (alias: `/fork`) | Branch the current session (explore a different path). |
 | `/agents` (alias: `/tasks`) | Show active agents and running tasks. |
 | `/sessions` | Browse and resume previous sessions. |

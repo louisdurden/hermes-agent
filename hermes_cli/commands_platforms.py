@@ -381,7 +381,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # rather than a recurring interactive surface (context, loop, save, approvals). Keep TIGHT — the
 # parity test reads this set. Aliases are never pinned ahead of canonicals.
 _SLACK_VIA_HERMES_ONLY = frozenset({
-    "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
+    "topup", "moa", "goa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
     "refine", "review", "pause", "whoami", "platform", "insights", "login"})
 
 
