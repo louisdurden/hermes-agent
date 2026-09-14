@@ -1185,3 +1185,34 @@ def test_humanize_non_registration_403_passthrough():
         )
         is None
     )
+
+
+def test_humanize_calendly_https_redirect_registration_error():
+    from tools.mcp_oauth import humanize_oauth_registration_error
+
+    message = humanize_oauth_registration_error(
+        "calendly",
+        RuntimeError(
+            'Registration failed: 400 {"error":"invalid_client_metadata",'
+            '"errors":{"redirect_uri":["must start with https in Production."]}}'
+        ),
+        server_url="https://mcp.calendly.com/mcp",
+    )
+
+    assert message is not None
+    assert "HTTPS callback" in message
+    assert "user-controlled HTTPS reverse proxy" in message
+    assert "will not rewrite the loopback callback" in message
+
+
+def test_humanize_other_https_redirect_registration_error_is_generic():
+    from tools.mcp_oauth import humanize_oauth_registration_error
+
+    assert (
+        humanize_oauth_registration_error(
+            "other",
+            RuntimeError("invalid_client_metadata: redirect_uri must start with https"),
+            server_url="https://mcp.example.com/mcp",
+        )
+        is None
+    )

@@ -743,7 +743,7 @@ def cmd_mcp_test(args):
     name = args.name
     cfg = _lookup_server(name, _get_mcp_servers(), "Available")
     if cfg is None:
-        return
+        return 1
     print()
     print(color(f"  Testing '{name}'...", Colors.CYAN))
     if "url" in cfg:
@@ -768,13 +768,14 @@ def cmd_mcp_test(args):
         tools = _probe_single_server(name, cfg)
     except Exception as exc:
         _error(f"Connection failed ({(time.monotonic() - start) * 1000:.0f}ms): {redact_mcp_probe_text(exc)}")
-        return
+        return 1
     _success(f"Connected ({(time.monotonic() - start) * 1000:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
     if tools:
         print()
         _print_tools(tools, 36, 55)
     print()
+    return 0
 
 
 def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = None) -> bool:
@@ -866,8 +867,9 @@ def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = N
 def cmd_mcp_login(args):
     """Run an explicit browser or device authorization for an OAuth-based MCP server."""
     cfg = _lookup_server(args.name, _get_mcp_servers())
-    if cfg is not None:
-        _reauth_oauth_server(args.name, cfg, flow=getattr(args, "flow", None))
+    if cfg is None:
+        return 1
+    return 0 if _reauth_oauth_server(args.name, cfg, flow=getattr(args, "flow", None)) else 1
 
 
 def cmd_mcp_reauth(args):
@@ -884,7 +886,7 @@ def cmd_mcp_reauth(args):
         oauth_servers = [(n, c) for n, c in servers.items() if c.get("auth") == "oauth" and c.get("url")]
         if not oauth_servers:
             _info("No OAuth-based MCP servers found in config.")
-            return
+            return 0
         print()
         _info(f"Re-authenticating {len(oauth_servers)} OAuth server(s) one at a time...")
         succeeded = 0
@@ -895,14 +897,15 @@ def cmd_mcp_reauth(args):
                 succeeded += 1
         print()
         _success(f"Re-authenticated {succeeded}/{len(oauth_servers)} server(s)")
-        return
+        return 0 if succeeded == len(oauth_servers) else 1
     if not name:
         _error("Specify a server name, or use --all to re-auth every OAuth server.")
         _info("Usage: hermes mcp reauth <name>   |   hermes mcp reauth --all")
-        return
+        return 1
     cfg = _lookup_server(name, servers)
-    if cfg is not None:
-        _reauth_oauth_server(name, cfg)
+    if cfg is None:
+        return 1
+    return 0 if _reauth_oauth_server(name, cfg) else 1
 
 
 def _rebuild_exclude_list(
@@ -1058,8 +1061,7 @@ def mcp_command(args):
         "config": cmd_mcp_configure, "login": cmd_mcp_login, "reauth": cmd_mcp_reauth,
     }.get(action)
     if handler:
-        handler(args)
-        return
+        return handler(args)
     # No subcommand — drop the user into the catalog picker (same UX as `hermes plugin`).
     from hermes_cli.mcp_picker import run_picker
     run_picker()

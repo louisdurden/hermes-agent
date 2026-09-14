@@ -7,6 +7,8 @@ any actual MCP servers or API keys.
 
 import argparse
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -298,10 +300,27 @@ class TestMcpTest:
         )
         from hermes_cli.mcp_config import cmd_mcp_test
 
-        cmd_mcp_test(_make_args(name="ink"))
+        result = cmd_mcp_test(_make_args(name="ink"))
         out = capsys.readouterr().out
         assert "Connected" in out
         assert "Tools discovered: 2" in out
+        assert result == 0
+
+    def test_test_missing_server_returns_failure(self, tmp_path):
+        _seed_config(tmp_path, {})
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        assert cmd_mcp_test(_make_args(name="ghost")) == 1
+
+    def test_test_probe_failure_returns_failure(self, tmp_path, monkeypatch):
+        _seed_config(tmp_path, {"broken": {"url": "https://mcp.example.com/mcp"}})
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        assert cmd_mcp_test(_make_args(name="broken")) == 1
 
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
@@ -682,6 +701,35 @@ class TestDispatcher:
         out = capsys.readouterr().out
         assert "Commands:" in out or "No MCP servers" in out
 
+    def test_dispatcher_propagates_handler_status(self, monkeypatch):
+        from hermes_cli import mcp_config
+
+        monkeypatch.setattr(mcp_config, "cmd_mcp_test", lambda _args: 7)
+        assert mcp_config.mcp_command(_make_args(mcp_action="test")) == 7
+
+    def test_cli_process_exits_nonzero_when_mcp_test_fails(self, tmp_path):
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(tmp_path)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "mcp",
+                "test",
+                "__definitely_missing__",
+            ],
+            cwd=Path(__file__).parents[2],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 1
+        assert "not found" in result.stdout
+
 
 # ---------------------------------------------------------------------------
 # Tests: Task 7 consolidation — cmd_mcp_remove evicts manager cache,
@@ -721,9 +769,10 @@ class TestMcpLogin:
     def test_login_rejects_unknown_server(self, tmp_path, capsys):
         _seed_config(tmp_path, {})
         from hermes_cli.mcp_config import cmd_mcp_login
-        cmd_mcp_login(_make_args(name="ghost"))
+        result = cmd_mcp_login(_make_args(name="ghost"))
         out = capsys.readouterr().out
         assert "not found" in out
+        assert result == 1
 
 
     def test_login_false_success_no_token(self, tmp_path, capsys, monkeypatch):
@@ -749,12 +798,13 @@ class TestMcpLogin:
         # No token file is created → _oauth_tokens_present() returns False.
         from hermes_cli.mcp_config import cmd_mcp_login
 
-        cmd_mcp_login(_make_args(name="googledrive"))
+        result = cmd_mcp_login(_make_args(name="googledrive"))
         out = capsys.readouterr().out
 
         assert "no OAuth token was obtained" in out
         assert "Authenticated" not in out
         assert "client_id" in out
+        assert result == 1
 
     def test_login_genuine_success_with_token(self, tmp_path, capsys, monkeypatch):
         """Probe lists tools AND a token exists → report real success."""
@@ -780,7 +830,7 @@ class TestMcpLogin:
 
         from hermes_cli.mcp_config import cmd_mcp_login
 
-        cmd_mcp_login(_make_args(name="realserver"))
+        result = cmd_mcp_login(_make_args(name="realserver"))
         out = capsys.readouterr().out
 
         assert "Authenticated — 3 tool(s) available" in out
@@ -788,6 +838,7 @@ class TestMcpLogin:
         # The login path must grant a human enough time to finish the browser
         # OAuth round-trip — far longer than the 30s probe default.
         assert seen["connect_timeout"] >= 180
+        assert result == 0
 
 
 # ---------------------------------------------------------------------------
@@ -812,11 +863,12 @@ class TestMcpReauth:
         )
         from hermes_cli.mcp_config import cmd_mcp_reauth
 
-        cmd_mcp_reauth(_make_args(name=None, all=True))
+        result = cmd_mcp_reauth(_make_args(name=None, all=True))
         out = capsys.readouterr().out
 
         assert visited == ["gh", "jira"]
         assert "Re-authenticated 2/2 server(s)" in out
+        assert result == 0
 
     def test_reauth_all_reports_partial_failures(self, tmp_path, capsys, monkeypatch):
         """A server that fails to re-auth is counted but doesn't abort the rest."""
@@ -830,10 +882,11 @@ class TestMcpReauth:
         )
         from hermes_cli.mcp_config import cmd_mcp_reauth
 
-        cmd_mcp_reauth(_make_args(name=None, all=True))
+        result = cmd_mcp_reauth(_make_args(name=None, all=True))
         out = capsys.readouterr().out
 
         assert "Re-authenticated 1/2 server(s)" in out
+        assert result == 1
 
 
     def test_reauth_unknown_server(self, tmp_path, capsys):
@@ -842,9 +895,10 @@ class TestMcpReauth:
         })
         from hermes_cli.mcp_config import cmd_mcp_reauth
 
-        cmd_mcp_reauth(_make_args(name="ghost", all=False))
+        result = cmd_mcp_reauth(_make_args(name="ghost", all=False))
         out = capsys.readouterr().out
         assert "not found" in out
+        assert result == 1
 
 
 def test_tool_filters_keeps_explicit_empty_include():
