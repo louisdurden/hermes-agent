@@ -994,12 +994,14 @@ class _RequestClientRegistry:
         self.client = None
         self.kind = "openai"
         self.owner_tid = None
+        self.poisoned = False
         self.diag = None  # per-attempt stream diagnostics (streaming path)
         self.lock = threading.Lock()
 
     def set_client(self, client, *, kind: str = "openai"):
         with self.lock:
             self.client, self.kind, self.owner_tid = client, kind, threading.get_ident()
+            self.poisoned = False
         return client
 
     @staticmethod
@@ -1023,6 +1025,18 @@ class _RequestClientRegistry:
         except Exception as exc:
             logger.debug("Streaming response handle close failed (%s): %s", reason, exc)
 
+    def poison_once(self, reason: str) -> None:
+        """Abort an owned request client once while retaining it for owner cleanup."""
+        with self.lock:
+            request_client, request_kind = self.client, self.kind
+            if request_client is None or request_kind == "stream" or self.poisoned:
+                return
+            self.poisoned = True
+            abort = (self.agent._abort_request_anthropic_client
+                     if request_kind == "anthropic_messages"
+                     else self.agent._abort_request_openai_client)
+            abort(request_client, reason=reason)
+
     def close_once(self, reason: str) -> None:
         with self.lock:
             request_client, request_kind, owner_tid = self.client, self.kind, self.owner_tid
@@ -1033,12 +1047,16 @@ class _RequestClientRegistry:
                 and owner_tid != threading.get_ident()
             )
             if stranger_thread:
+                if self.poisoned:
+                    return
+                self.poisoned = True
                 abort = (self.agent._abort_request_anthropic_client if request_kind == "anthropic_messages"
                          else self.agent._abort_request_openai_client)
                 abort(request_client, reason=reason)
                 return
             self.client = None
             self.owner_tid = None
+            self.poisoned = False
         if request_client is None:
             return
         if request_kind == "stream":
@@ -2813,8 +2831,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 except Exception:
                     # Still checked out: poison the slot so the finally really closes the pool.
                     if self._attempt_request_client is not None:
-                        self.agent._abort_request_openai_client(
-                            self._attempt_request_client, reason="interrupt_stream_close_failed")
+                        self.clients.poison_once("interrupt_stream_close_failed")
                 break
             if not self._stream_attempt_is_active(stream_attempt_id):
                 self._discard_stale_stream_chunk(stream_attempt_id, chunk)

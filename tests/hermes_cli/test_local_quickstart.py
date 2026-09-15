@@ -178,6 +178,13 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
 
     assert load_config()["local_runtime"]["enabled"] is True
 
+    # A terminal status must not be visible until the single-flight lock is
+    # released; an immediate successor therefore cannot inherit a stale 409.
+    successor = client.post("/api/local-models/quickstart", json={})
+    assert successor.status_code == 200
+    successor_job = _wait_job(client, successor.json()["job_id"])
+    assert successor_job["status"] == "done", successor_job["error"]
+
 
 def test_quickstart_skips_satisfied_legs(client, monkeypatch):
     """Runtime present and model already staged: the response says so and
