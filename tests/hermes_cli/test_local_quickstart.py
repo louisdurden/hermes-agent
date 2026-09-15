@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,6 +36,24 @@ def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
             return job
         time.sleep(0.05)
     raise AssertionError(f"job {job_id} still running after {timeout}s")
+
+
+@pytest.fixture
+def automatic_recommendation(monkeypatch):
+    """Keep automatic quickstart tests independent of CI host hardware."""
+    import hermes_cli.web_routers.local_models as lm
+
+    monkeypatch.setattr(
+        lm.catalog,
+        "recommended_entry",
+        lambda budget, entries: (entries[0], "best-quality-resident"),
+    )
+    monkeypatch.setattr(
+        lm.catalog,
+        "select_variant",
+        lambda entry, budget: SimpleNamespace(variant=entry.variants[0]),
+    )
+    monkeypatch.setattr(lm, "_engine_too_old", lambda min_engine: False)
 
 
 def test_quickstart_unknown_model_404s(client):
@@ -118,7 +137,9 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(
+    client, monkeypatch, tmp_path, automatic_recommendation
+):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -159,7 +180,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is True
     assert body["needs_download"] is True
@@ -186,7 +207,9 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert successor_job["status"] == "done", successor_job["error"]
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(
+    client, monkeypatch, automatic_recommendation
+):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -217,7 +240,7 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["needs_runtime"] is False
     assert body["needs_download"] is False
