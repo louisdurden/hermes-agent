@@ -10,7 +10,8 @@ def _workflow(name: str) -> str:
 
 def test_required_workflows_use_runners_available_to_the_fork() -> None:
     workflows = "\n".join(
-        _workflow(name) for name in ("tests.yml", "tests-os.yml", "nix.yml")
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml"))
     )
 
     assert "ubuntu-latest-96-core" not in workflows

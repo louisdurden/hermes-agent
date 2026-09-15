@@ -4,6 +4,4 @@
 self-hosted-runner:
   labels:
     - ubuntu-latest-96-core
-    - ubuntu-latest-32-core
     - ubuntu-latest-32-arm-core
-    - windows-latest-32-core
