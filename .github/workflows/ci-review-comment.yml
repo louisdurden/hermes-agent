@@ -1,37 +1,31 @@
 name: CI review comment
 
-# Live-updating PR review comment.
+# Final PR review comment.
 #
-# The poller runs for up to 40 minutes.
-# This run lives in its own workflow.
-# A run stays in progress until its last job ends, and GitHub refuses
-# ``gh run rerun`` on a run that is in progress.
+# This run lives in its own workflow and starts only after CI completes.
+# Starting a polling job while CI is in progress can deadlock repositories
+# with a single concurrent runner: the poller occupies the only runner while
+# waiting for the jobs that runner would otherwise execute.
 #
-# ``workflow_run`` starts this when CI starts. It always reads the workflow
+# ``workflow_run`` starts this when CI finishes. It always reads the workflow
 # and the scripts from the default branch, never from the PR head.
 # It makes a write token safe here.
 #
-# The poller reads job results through the API. Thus it watches the CI run
-# and the separate docker run, and it depends on neither.
+# The reporter reads job results through the API. Thus it covers the CI run
+# and the separate docker run without occupying a runner during either one.
 
 on:
   workflow_run:
     workflows: [CI]
-    # ``in_progress``, not ``requested``: a first-time contributor's run
-    # sits in ``action_required`` until a maintainer approves it, and
-    # ``requested`` fires at creation — the poller would wait out its
-    # whole timeout on a run that never starts. ``in_progress`` fires
-    # when the run actually starts, and it also fires on re-runs, which
-    # ``requested`` does not.
-    types: [in_progress]
+    types: [completed]
 
 permissions:
   contents: read
   actions: read
   pull-requests: write
 
-# One poller per CI run. A new push starts a new CI run, and its poller
-# cancels the poller of the run that GitHub superseded. The group keys
+# One reporter per CI run. A new push starts a new CI run, and its reporter
+# cancels the reporter of the run that GitHub superseded. The group keys
 # on the head repository too: fork PRs often share a branch name
 # (``main``, ``patch-1``), and two PRs must not cancel each other.
 concurrency:
@@ -40,14 +34,14 @@ concurrency:
 
 jobs:
   comment:
-    name: CI review comment (live)
-    # Fork PRs get no comment: the poller needs a write token, and the
+    name: CI review comment
+    # Fork PRs get no comment: the reporter needs a write token, and the
     # ``pull_requests`` payload is empty for a fork run.
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
       - name: Checkout trusted default branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -55,7 +49,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Run live comment poller
+      - name: Publish final CI comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The CI run to report on — not this run. The name must not be
@@ -76,5 +70,5 @@ jobs:
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
         run: |
           python3 -u scripts/ci/live_comment.py \
-            --interval 15 \
-            --timeout 3000
+            --interval 5 \
+            --timeout 300

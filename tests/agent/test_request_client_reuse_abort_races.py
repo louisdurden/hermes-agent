@@ -193,6 +193,31 @@ def test_relay_managed_close_failure_poisons_request_client(tmp_path, monkeypatc
     assert abort_reasons == [(request_client, "interrupt_stream_close_failed")]
 
 
+def test_owner_poison_suppresses_later_stranger_abort():
+    """Once the owner poisons a slot, an interrupt thread must not abort it twice."""
+    from agent.chat_completion_helpers import _RequestClientRegistry
+
+    agent = _make_agent()
+    request_client = MagicMock()
+    abort_reasons = []
+    registry = _RequestClientRegistry(agent)
+    registry.set_client(request_client)
+
+    with patch.object(
+        agent,
+        "_abort_request_openai_client",
+        side_effect=lambda client, *, reason: abort_reasons.append((client, reason)),
+    ):
+        registry.poison_once("interrupt_stream_close_failed")
+        thread = threading.Thread(
+            target=lambda: registry.close_once("stream_interrupt_abort"), daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert abort_reasons == [(request_client, "interrupt_stream_close_failed")]
+
+
 def test_stale_abort_is_atomic_with_holder_read(monkeypatch):
     """The stranger-thread abort must complete before the worker's finally
     can pop + cache the client.

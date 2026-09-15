@@ -764,9 +764,14 @@ async def local_models_quickstart(body: QuickstartBody):
                        fail_detail="The local server could not start — open Local Models for details",
                        skip_msg="quickstart rescan check skipped")
         _assign_default(job, variant.model_id)
-        _finish(job, f"{entry.display_name} is ready — new chats use it")
+        _step(job, "done", f"{entry.display_name} is ready — new chats use it")
 
-    _spawn_job(job, "lr-quickstart", _run, fail_msg="quickstart failed: %s", on_exit=_QUICKSTART_LOCK.release)
+    def _release_quickstart() -> None:
+        _QUICKSTART_LOCK.release()
+        if job["status"] == "running":
+            job["status"] = "done"
+
+    _spawn_job(job, "lr-quickstart", _run, fail_msg="quickstart failed: %s", on_exit=_release_quickstart)
     return {"job_id": job["job_id"], "model_id": entry.id, "display_name": entry.display_name,
             "needs_runtime": need_runtime, "needs_download": need_download, "download_bytes": download_bytes}
 

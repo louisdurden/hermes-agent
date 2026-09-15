@@ -1,6 +1,9 @@
 """Behavioral tests for the state-holder and repair-admission authority."""
 
+import errno
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,3 +51,24 @@ def test_foreign_holder_accepts_same_inode_reached_through_an_alias(
     assert hermes_state_holders.foreign_state_db_holders(db_path) == [
         (222, str(alias_path))
     ]
+
+
+def test_foreign_holder_scan_timeout_remains_fail_closed(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.touch()
+
+    def _timed_out(_attrs):
+        raise TimeoutError(errno.ETIMEDOUT, "process scan timed out")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "psutil",
+        SimpleNamespace(process_iter=_timed_out),
+    )
+
+    holders = hermes_state_holders.foreign_state_db_holders(db_path)
+
+    assert len(holders) == 1
+    assert holders[0][0] == -1
+    assert holders[0][1].startswith("open-file scan failed:")

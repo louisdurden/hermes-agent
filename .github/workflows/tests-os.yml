@@ -61,7 +61,9 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Larger-runner labels belong to the upstream organization and
+            # never acquire a runner in this fork.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code

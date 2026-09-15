@@ -59,6 +59,11 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 
+# This file exercises macOS audio teardown paths that can segfault during
+# interpreter finalization when many pytest subprocesses exit concurrently.
+# Run it only after the parallel pool drains; nonzero exits remain failures.
+_SERIAL_FILES = {"tests/tools/test_voice_cli_integration.py"}
+
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
 # image, etc.) and are run in their own dedicated CI jobs:
@@ -746,6 +751,15 @@ def _slice_files(
     return target
 
 
+def _requires_serial_execution(file: Path, repo_root: Path) -> bool:
+    """Return whether a test file must run without sibling pytest processes."""
+    try:
+        relative = file.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    return relative in _SERIAL_FILES
+
+
 def _make_stdio_glyph_safe() -> None:
     """Keep status glyphs from killing the runner on narrow console encodings.
 
@@ -1122,21 +1136,31 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    def _run_batch(batch: List[Path], max_workers: int) -> None:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures: List[Future] = []
+            for file in batch:
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file, file, pytest_passthrough, repo_root,
+                    args.file_timeout, args.file_retries,
+                )
+                fut.add_done_callback(
+                    lambda f, file=file, t0=t0: _on_done(file, t0, f)
+                )
+                futures.append(fut)
+            # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+            # for all submitted work, but doing it explicitly here makes the
+            # control flow obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+
+    serial_files = [
+        file for file in files if _requires_serial_execution(file, repo_root)
+    ]
+    parallel_files = [file for file in files if file not in serial_files]
+    _run_batch(parallel_files, args.jobs)
+    _run_batch(serial_files, 1)
 
     elapsed = time.monotonic() - started
     print()

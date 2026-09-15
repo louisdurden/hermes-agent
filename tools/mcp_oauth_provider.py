@@ -10,10 +10,33 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from tools.mcp_oauth import HermesTokenStorage
 logger = logging.getLogger(__name__)
+
+
+def repair_authorization_endpoint_query(authorization_endpoint: object, authorization_url: str) -> str:
+    """Repair SDK 2.0 URLs when endpoint query values absorb generated OAuth parameters."""
+    endpoint_text = str(authorization_endpoint)
+    endpoint = urlsplit(endpoint_text)
+    authorization_url = str(authorization_url)
+    if not endpoint.query:
+        return authorization_url
+
+    malformed_prefix = endpoint_text + "?"
+    if not authorization_url.startswith(malformed_prefix):
+        return authorization_url
+
+    generated = parse_qsl(authorization_url[len(malformed_prefix):], keep_blank_values=True)
+    generated_names = {name for name, _ in generated}
+    retained = [
+        (name, value)
+        for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+        if name not in generated_names
+    ]
+    return urlunsplit(endpoint._replace(query=urlencode([*retained, *generated], doseq=True)))
 
 
 class HermesProviderMixin:
@@ -28,6 +51,7 @@ class HermesProviderMixin:
     - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
 
     _hermes_logger: logging.Logger = logger
+    context: Any
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -35,6 +59,17 @@ class HermesProviderMixin:
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+        original_redirect_handler = self.context.redirect_handler
+
+        async def redirect_handler(authorization_url: str) -> None:
+            authorization_url = str(authorization_url)
+            metadata = getattr(self.context, "oauth_metadata", None)
+            endpoint = getattr(metadata, "authorization_endpoint", None)
+            if endpoint:
+                authorization_url = repair_authorization_endpoint_query(str(endpoint), authorization_url)
+            await original_redirect_handler(authorization_url)
+
+        self.context.redirect_handler = redirect_handler
 
     async def _perform_authorization(self):
         info = self.context.client_info

@@ -1002,6 +1002,22 @@ def humanize_oauth_registration_error(
     when the user overrode it or an older Hermes is running."""
     msg = str(exc)
     lowered = msg.lower()
+    host = (urlparse(server_url).hostname or "").lower() if server_url else ""
+    is_calendly = server_name.strip().lower() == "calendly" or host == "mcp.calendly.com"
+    if (
+        is_calendly
+        and "400" in msg
+        and "invalid_client_metadata" in lowered
+        and "redirect_uri" in lowered
+        and "must start with https" in lowered
+    ):
+        return (
+            f"'{server_name}' requires an HTTPS OAuth callback in production. Configure a user-controlled "
+            "HTTPS reverse proxy or Tailscale Funnel that forwards to Hermes, then set both "
+            "oauth.redirect_uri (the public HTTPS callback) and oauth.redirect_port (the matching local "
+            "listener port) before re-running the login. Hermes will not rewrite the loopback callback to "
+            "https://127.0.0.1 because its local listener does not provide TLS."
+        )
     looks_like_registration = ("403" in msg or "forbidden" in lowered) and (
         any(k in lowered for k in ("regist", "dcr", "dynamic client"))
         or lowered.strip() in {"forbidden", "403 forbidden", "http 403: forbidden"}
