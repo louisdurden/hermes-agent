@@ -62,8 +62,11 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
+      # Run every check, but serialize the units on the fork's two-core public
+      # runner. Several units launch their own Vitest worker pools; running the
+      # units concurrently oversubscribes the runner and makes otherwise-fast
+      # UI tests hit their timeouts. The step still reports every failure after
+      # all units finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
       #     run then reports one failure, where the matrix this replaced
@@ -80,4 +83,4 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1
