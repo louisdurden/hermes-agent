@@ -46,6 +46,8 @@ describe('known install failures', () => {
     }
 
     expect(matchKnownFailure(sample)?.id).toBe('windows-july-manual-app-update')
+    expect(matchKnownFailure({ ...sample, commit: '3ef6bbd201263d354fd83ec55b3c306ded2eb72a' })?.id)
+      .toBe('windows-july-manual-app-update')
     expect(matchKnownFailure({ ...sample, installMethod: 'desktop-installer@latest' })).toBeNull()
     expect(matchKnownFailure({ ...sample, error: 'onboarding timed out' })).toBeNull()
     expect(matchKnownFailure({ ...sample, logs: { desktop: '[updates] manual: hermes update' } })).toBeNull()

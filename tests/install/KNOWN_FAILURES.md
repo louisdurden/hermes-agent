@@ -25,13 +25,16 @@ Re-running the installer is a separate tested upgrade route. Invoking the old CL
 
 Classification: **unfixable in the update target for the exact released app-button path**.
 
-Starting release: `v2026.7.1`, commit `7c1a029553d87c43ecff8a3821336bc95872213b`.
+Starting releases: `v2026.7.1` (`7c1a029553d87c43ecff8a3821336bc95872213b`) and `v2026.7.20` (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`). Both released apps take the same manual-only branch after script installs.
 
 | Install → update | Verified failing job |
 |---|---|
 | `installer-script` → `hermes-desktop-app-update` | [101514755236](https://github.com/ethernet8023/hermes-agent/actions/runs/34043635705/job/101514755236) |
 | `installer-script+desktop` → `hermes-desktop-app-update` | [101514760893](https://github.com/ethernet8023/hermes-agent/actions/runs/34043635705/job/101514760893) |
 | `installer-script+desktop` → `open-app-update` | [101514756508](https://github.com/ethernet8023/hermes-agent/actions/runs/34043635705/job/101514756508) |
+| `v2026.7.20`: `installer-script` → `hermes-desktop-app-update` | [104797569121](https://github.com/louisdurden/hermes-agent/actions/runs/35097253224/job/104797569121) |
+| `v2026.7.20`: `installer-script+desktop` → `hermes-desktop-app-update` | [104797569331](https://github.com/louisdurden/hermes-agent/actions/runs/35097253224/job/104797569331) |
+| `v2026.7.20`: `installer-script+desktop` → `open-app-update` | [104797569294](https://github.com/louisdurden/hermes-agent/actions/runs/35097253224/job/104797569294) |
 
 These script installs have no staged updater. The released Electron code (`apps/desktop/electron/main.cjs:2212-2214`) logs `no staged updater; surfacing manual` and returns `{ ok: true, manual: true, command }`. It does not start an update. Each job's `logs/desktop.log` records that branch followed by `[updates] manual: hermes update`; no target checkout/result signal appears.
 
