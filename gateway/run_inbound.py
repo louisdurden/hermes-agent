@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
 import dataclasses
+import inspect
 import json
 import os
 import re
@@ -1069,11 +1070,19 @@ class GatewayInboundMixin:
                     _plugin_context = build_session_context(source, self.config)
                     _plugin_context.session_key = self._session_key_for_source(source)
                     user_args = event.get_command_args().strip()
+                    # Preserve attachments for handlers that explicitly accept them, while
+                    # keeping existing one-argument plugin commands compatible.
+                    try:
+                        handler_args = (user_args, list(event.media_urls or [])) if (
+                            len(inspect.signature(plugin_handler).parameters) >= 2
+                        ) else (user_args,)
+                    except (TypeError, ValueError):
+                        handler_args = (user_args,)
                     with self._session_env_scope(_plugin_context):
                         if asyncio.iscoroutinefunction(plugin_handler):
-                            result = await plugin_handler(user_args)
+                            result = await plugin_handler(*handler_args)
                         else:
-                            result = await self._run_in_executor_with_context(plugin_handler, user_args)
+                            result = await self._run_in_executor_with_context(plugin_handler, *handler_args)
                             if asyncio.iscoroutine(result):
                                 result = await result
                     return True, str(result) if result else None, command
