@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
 import dataclasses
+import inspect
 import json
 import os
 import re
@@ -1163,7 +1164,24 @@ class GatewayInboundMixin:
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
+                    args_text = event.get_command_args().strip()
+                    # Some plugin handlers accept a second positional ``media_urls`` param
+                    # (e.g. commands that forward attached photos to a vision model).
+                    # Signature-detect arity rather than always passing 1 or 2 args, so
+                    # existing text-only plugin handlers keep working unchanged (#no-issue
+                    # link — bug found live 2026-09-20: this call always passed a single
+                    # arg regardless of what the handler declared, so any plugin command
+                    # that also wanted the message's attachments crashed with a
+                    # missing-positional-argument TypeError, caught below and silently
+                    # reported to the user as "unknown command").
+                    try:
+                        accepts_media = len(inspect.signature(plugin_handler).parameters) >= 2
+                    except (TypeError, ValueError):
+                        accepts_media = False
+                    if accepts_media:
+                        result = plugin_handler(args_text, list(event.media_urls or []))
+                    else:
+                        result = plugin_handler(args_text)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return True, str(result) if result else None, command
