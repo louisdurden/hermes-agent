@@ -1,0 +1,4 @@
+name: local-qwen-chat
+version: 1.1.0
+description: "Direct, stateless /local chat with the local Qwen/MedGemma router (port 9099). Text-only or with cached photo attachments (dermatology support prompt via MedGemma)."
+author: "Rodrigo Hamuy"
