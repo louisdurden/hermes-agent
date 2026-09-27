@@ -316,3 +316,27 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
     # Bound only for the handler call, not leaked past dispatch
     assert get_session_env("HERMES_SESSION_KEY") == ""
 
+
+@pytest.mark.asyncio
+async def test_plugin_slash_command_forwards_media_urls_when_handler_accepts_them(monkeypatch):
+    """Two-argument plugin commands receive attachments without changing one-arg commands."""
+    from gateway.config import GatewayConfig, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from hermes_cli import plugins as plugins_mod
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    runner._draining = False
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    event = MessageEvent(text="/local describe", source=source, message_id="m1", media_urls=["file:///photo.jpg"])
+    received = []
+
+    def handler(args, media_urls):
+        received.extend((args, media_urls))
+        return "ok"
+
+    monkeypatch.setattr(plugins_mod, "get_plugin_command_handler", lambda name: handler if name == "local" else None)
+    handled, result, command = await runner._hm_dispatch_quick_and_plugin_commands(event, source, "local")
+
+    assert (handled, result, command) == (True, "ok", "local")
+    assert received == ["describe", ["file:///photo.jpg"]]

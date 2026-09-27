@@ -276,6 +276,19 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_minimal_index_replaces_skill_catalog_with_categories(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "research" / "literature-search"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: literature-search\ndescription: Search papers\n---\n")
+        (tmp_path / "config.yaml").write_text("skills:\n  index_mode: minimal\n")
+
+        result = build_skills_system_prompt()
+
+        assert "<available_skills>" not in result
+        assert "research (1)" in result
+        assert "literature-search" not in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
