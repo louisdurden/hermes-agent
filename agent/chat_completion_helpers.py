@@ -2070,11 +2070,27 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+def _skip_fallback_for_local_primary(agent) -> bool:
+    """``fallback_skip_local: true`` keeps a local-endpoint primary (oMLX, Ollama…) from silently
+    failing over to a paid cloud provider; the failure surfaces to the user instead."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        if not load_config_readonly().get("fallback_skip_local"):
+            return False
+    except Exception:
+        return False
+    return bool(getattr(agent, "base_url", "")) and is_local_endpoint(agent.base_url)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    if _skip_fallback_for_local_primary(agent):
+        logger.info("Fallback skipped: primary %s is a local endpoint and fallback_skip_local is on",
+                    getattr(agent, "base_url", ""))
+        return False
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
