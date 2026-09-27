@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -1204,6 +1205,46 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+def _skills_index_mode() -> str:
+    """``skills.index_mode``: ``full`` (default) or ``minimal`` (categories only, skills loaded on demand)."""
+    try:
+        from agent.skill_utils import _skills_cfg_get
+        return str(_skills_cfg_get("index_mode") or "full").strip().lower()
+    except Exception:
+        return "full"
+
+
+def _minimal_skills_index(full: str) -> str:
+    """Replace the per-skill catalog with category names + counts; the model lists a
+    category with skills_list(category=...) and loads a skill with skill_view(name)."""
+    m = re.search(r"<available_skills>\n(.*?)</available_skills>", full, re.DOTALL)
+    if not m:
+        return full
+    cats: dict[str, int] = {}
+    current = None
+    for line in m.group(1).splitlines():
+        if line.startswith("    - "):
+            if current:
+                cats[current] += 1
+        elif line.startswith("  ") and not line.startswith("   "):
+            head = line.strip()
+            if " [names only]:" in head:
+                name, names = head.split(" [names only]:", 1)
+                cats[name] = cats.get(name, 0) + len([n for n in names.split(",") if n.strip()])
+                current = None
+            else:
+                current = head.split(":", 1)[0]
+                cats.setdefault(current, 0)
+    listing = ", ".join(f"{c} ({n})" for c, n in sorted(cats.items()))
+    return (
+        "## Skills\n"
+        "Skills hold the user's workflows, conventions and tool-specific knowledge. They are loaded on "
+        "demand: when a task might match one, call skills_list(category=...) for the relevant category, "
+        "then skill_view(name) and follow it. Skill categories (count): " + listing + ".\n"
+        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+    )
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None, available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None, skills_dir_override: "Path | None" = None,
@@ -1228,8 +1269,9 @@ def build_skills_system_prompt(
         project_dirs = get_project_skills_dirs()
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
-        return _build_skills_system_prompt_inner(
+        full = _build_skills_system_prompt_inner(
             skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+        return _minimal_skills_index(full) if _skills_index_mode() == "minimal" else full
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
