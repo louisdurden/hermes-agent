@@ -29,6 +29,7 @@ def test_stop_gate_replacement_is_the_returned_final_response():
         valid_tool_names=[],
         quiet_mode=True,
         session_id="session",
+        model="test-model",
         api_mode="chat_completions",
     )
 
