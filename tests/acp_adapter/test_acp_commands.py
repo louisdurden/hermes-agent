@@ -116,6 +116,7 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
             _get_platform_tools=lambda config, platform: {"hermes-acp", "terminal", "web"}
             if platform == "acp"
             else set(),
+            enabled_mcp_server_names=lambda config: set(),
         ),
     )
 
@@ -221,6 +222,7 @@ async def test_acp_prompt_during_mutating_command_queues_then_runs():
         {"role": "assistant", "content": "ran: follow-up"},
     ]
     assert state.command_op is False
+@pytest.mark.asyncio
 async def test_acp_records_content_free_delivery_outcome(caplog):
     acp_agent, state, fake, _conn = make_agent_and_state()
     original_run = fake.run_conversation
