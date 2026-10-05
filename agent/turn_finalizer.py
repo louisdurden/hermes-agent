@@ -799,22 +799,27 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
+    _pre_gate_response = final_response
     if final_response and not interrupted:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
         )
+    # Avisos del host (pie de mutaciones, "No reply: streaming stopped…") son solo de entrega y no
+    # van al historial (#44239): este sync existe únicamente para cuando el gate reescribió el texto.
+    _gate_rewrote_response = final_response != _pre_gate_response
 
     # Surrogate chokepoint: sanitize before both durable storage and external delivery.
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
-    _sync_delivered_response_to_transcript(
-        agent,
-        messages,
-        prior_response=_transcript_final_response,
-        delivered_response=final_response,
-    )
+    if _gate_rewrote_response:
+        _sync_delivered_response_to_transcript(
+            agent,
+            messages,
+            prior_response=_transcript_final_response,
+            delivered_response=final_response,
+        )
     if _persistence_prepared:
         _guarded_cleanup(
             "persist_session",
