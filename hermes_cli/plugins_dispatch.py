@@ -267,15 +267,24 @@ class PluginDispatchMixin:
                 elif ret is not None:
                     results.append(ret)
             except (Exception, SystemExit) as exc:
-                self._report_hook_failure(hook_name, cb, kwargs, exc)
-                if hook_name == "pre_delivery":  # sin texto de la excepción: el turno es clínico
+                if hook_name == "pre_delivery":
+                    # El turno es clínico: la excepción puede contener PHI, así que solo se
+                    # registra su tipo (nunca _report_hook_failure, que escribe el mensaje).
+                    logger.warning(
+                        "Hook '%s' callback %s raised %s",
+                        hook_name,
+                        getattr(cb, "__name__", type(cb).__name__),
+                        type(exc).__name__,
+                    )
                     results.append({
                         "action": "block",
                         "message": PRE_DELIVERY_FAIL_CLOSED_MESSAGE,
                         "reason": "callback_error",
                     })
-                elif fail_closed:  # a guard that raised made no decision: same veto as a timeout
-                    results.append(_policy_error_block_directive(hook_name, cb, exc))
+                else:
+                    self._report_hook_failure(hook_name, cb, kwargs, exc)
+                    if fail_closed:  # a guard that raised made no decision: same veto as a timeout
+                        results.append(_policy_error_block_directive(hook_name, cb, exc))
         return results
 
     def _report_hook_failure(
