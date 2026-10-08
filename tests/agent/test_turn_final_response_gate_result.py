@@ -45,6 +45,7 @@ def test_stop_gate_replacement_is_the_returned_final_response():
     with patch("agent.turn_final_response.apply_stop_gates", side_effect=gate):
         verdict = finish_text_response(
             agent,
+            effective_task_id="",
             assistant_message=SimpleNamespace(content="unsafe clinical candidate", tool_calls=None),
             response=SimpleNamespace(),
             finish_reason="stop",

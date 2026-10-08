@@ -383,7 +383,11 @@ class StreamDeliveryMixin:
             think_scrubber = getattr(self, "_stream_think_scrubber", None)
             # See #5719.
             scrubber = getattr(self, "_stream_context_scrubber", None)
-            text = think_scrubber.feed(text) if think_scrubber is not None else self._strip_think_blocks(text)
+            strip_think = getattr(self, "_strip_think_blocks", None)
+            scrubbed_text = think_scrubber.feed(text) if think_scrubber is not None else (
+                strip_think(text) if callable(strip_think) else text
+            )
+            text = scrubbed_text if isinstance(scrubbed_text, str) else ""
             # Providers that inline reasoning (MiniMax-M3 <think>…</think>) send no reasoning delta, so the
             # live reasoning pane would stay empty; forward what the scrubber stripped instead (#89647).
             hidden = think_scrubber.last_hidden if think_scrubber is not None else ""
