@@ -593,3 +593,52 @@ def test_url_citations_match_returned_urls_despite_trailing_slash_scheme_and_www
     )
     assert plugin._on_pre_delivery(session_id="url-norm", response_text=response) == {"action": "allow"}
     assert plugin._url_key("HTTPS://www.Example.org/a/b/#frag") == "example.org/a/b"
+
+
+def _spanish_turn(plugin, session_id, passages):
+    plugin._on_pre_llm_call(
+        session_id=session_id,
+        user_message="¿Cómo entrenar con nebivolol por hipertensión? Quiero la evidencia del tratamiento y el ejercicio.",
+    )
+    plugin._on_post_tool_call(
+        session_id=session_id, tool_name="web_search", status="ok",
+        result='{"results":[{"title":"Nebivolol and exercise","url":"https://example.org/neb","text":"%s"}]}' % passages,
+    )
+
+
+def test_spanish_answer_over_english_evidence_is_not_rejected_as_irrelevant(plugin):
+    _spanish_turn(plugin, "xl", "Nebivolol lowered heart rate during exercise in hypertensive patients without impairing performance.")
+    answer = (
+        "El nebivolol redujo la frecuencia cardíaca durante el ejercicio en pacientes con hipertensión, "
+        "sin deteriorar el rendimiento." + _LEDGER
+    )
+    assert plugin._is_cross_language("¿Cómo entrenar con nebivolol por hipertensión?", "Nebivolol lowered heart rate during exercise in the study")
+    assert plugin._on_pre_delivery(session_id="xl", response_text=answer)["action"] in ("allow", "replace")
+
+
+def test_bibliography_lines_are_provenance_not_polarity_claims(plugin):
+    evidence = "Beta-blockade effects on exercise testing. The study showed a decrease in heart rate during exercise."
+    entry = "*Beta-blockade effects on exercise testing.* Estudió metoprolol, no nebivolol."
+    assert plugin._polarity_matches(entry, evidence) is True
+    assert plugin._polarity_matches("No hay disminución de la frecuencia cardíaca durante el ejercicio con beta-blockade.", evidence) in (True, False)
+
+
+def test_general_advice_without_clinical_anchor_gets_disclosure_not_another_repair_round(plugin):
+    _spanish_turn(plugin, "soft", "Nebivolol lowered heart rate during exercise in hypertensive patients without impairing performance.")
+    answer = (
+        "El nebivolol redujo la frecuencia cardíaca durante el ejercicio en hipertensos. "
+        "No conviene aumentar la intensidad solo para llegar a la zona que muestra el reloj." + _LEDGER
+    )
+    decision = plugin._on_pre_delivery(session_id="soft", response_text=answer)
+    assert decision["action"] in ("allow", "replace")
+
+
+def test_a_clinical_recommendation_with_no_support_is_still_blocked(plugin):
+    _spanish_turn(plugin, "hard", "Nebivolol lowered heart rate during exercise in hypertensive patients.")
+    answer = "Se recomienda suspender el anticoagulante antes de la cirugía de rinoplastia." + _LEDGER
+    assert plugin._on_pre_delivery(session_id="hard", response_text=answer)["action"] == "block"
+
+
+def test_indicadores_is_not_a_recommendation_verb(plugin):
+    assert plugin._RECOMMENDATION_RE.search("sin cambios en los indicadores metabólicos") is None
+    assert plugin._RECOMMENDATION_RE.search("se indica reducir la dosis") is not None

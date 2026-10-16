@@ -136,7 +136,7 @@ _DEGRADATION_TAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _RECOMMENDATION_RE = re.compile(
-    r"\b(?:recomiend\w*|sugier\w*|aconsej\w*|indic\w*|prescrib\w*|"
+    r"\b(?:recomiend\w*|sugier\w*|aconsej\w*|indic(?!ador)\w*|prescrib\w*|"
     r"debe\w*|deber[ií]a\w*|conviene\w*|conducta\w*)\b",
     re.IGNORECASE,
 )
@@ -592,11 +592,26 @@ def _has_sufficient_overlap(response: str, evidence: str) -> bool:
     return len(shared) >= required
 
 
+_ES_MARKERS = frozenset(("de", "la", "el", "que", "los", "las", "una", "para", "con", "por", "del", "como", "pero", "tu", "tus"))
+_EN_MARKERS = frozenset(("the", "of", "and", "that", "with", "for", "was", "were", "this", "from", "which", "patients", "study"))
+
+
+def _is_cross_language(user_message: str, evidence: str) -> bool:
+    """True si el pedido está en español y la evidencia recuperada es mayormente inglesa (o al revés): las palabras
+    ancla no coinciden por idioma, no por irrelevancia."""
+    def score(text: str, markers: frozenset) -> int:
+        words = re.findall(r"[a-záéíóúñ]+", (text or "").lower())
+        return sum(1 for word in words if word in markers) * 1000 // max(1, len(words))
+    user_es, user_en = score(user_message, _ES_MARKERS), score(user_message, _EN_MARKERS)
+    ev_es, ev_en = score(evidence, _ES_MARKERS), score(evidence, _EN_MARKERS)
+    return (user_es > user_en and ev_en > ev_es) or (user_en > user_es and ev_es > ev_en)
+
+
 def _evidence_is_relevant(user_message: str, response: str, evidence: str) -> bool:
     response_tokens = _content_tokens(response)
     evidence_tokens = _content_tokens(evidence)
     anchors = _content_tokens(user_message) & response_tokens
-    if anchors and not anchors & evidence_tokens:
+    if anchors and not anchors & evidence_tokens and not _is_cross_language(user_message, evidence):
         return False
     shared = response_tokens & evidence_tokens
     return len(shared) >= min(2, len(response_tokens))
@@ -612,17 +627,23 @@ _QUERY_ANSWER_ECHO_RE = re.compile(
 )
 
 
+# Entrada de bibliografía: empieza con el título de la fuente en cursiva simple (*Título.*) o con un enlace [texto](url).
+_CITATION_LINE_RE = re.compile(r"^\s*(?:[-•]\s*|\d+[.)]\s*)?(?:\*(?!\*)|\[)")
+
+
 def _polarity_matches(response: str, evidence: str) -> bool:
     """Require every evidence-linked response sentence to have matching polarity."""
     response_sentences = _claim_sentences(response)
     evidence_sentences = _claim_sentences(evidence)
     for response_sentence in response_sentences:
+        if _URL_RE.search(response_sentence) or _CITATION_LINE_RE.match(response_sentence):
+            continue  # línea de cita/procedencia: repite el título de la fuente, no afirma un resultado clínico
         response_tokens = _content_tokens(response_sentence)
         if not response_tokens:
             continue
         relevant = [
             sentence for sentence in evidence_sentences
-            if len(response_tokens & _content_tokens(sentence)) >= min(2, len(response_tokens))
+            if len(response_tokens & _content_tokens(sentence)) >= min(len(response_tokens), max(2, (len(response_tokens) + 1) // 2))
         ]
         if not relevant:
             continue
@@ -928,6 +949,26 @@ def _claim_is_supported(
     )
 
 
+def _claim_contradicted(claim: str, records: list[_EvidenceRecord]) -> bool:
+    """True sólo si hay una frase de la evidencia comparable (mismas cifras y al menos la mitad de las palabras) que
+    contradice la afirmación en polaridad o relación. Sin frase comparable (otro idioma, otro contexto) es no verificable."""
+    specifics = _specific_tokens(claim)
+    if not specifics:
+        return False
+    claim_tokens = _content_tokens(claim)
+    needed = min(len(claim_tokens), max(2, (len(claim_tokens) + 1) // 2))
+    related = [
+        fragment
+        for record in records
+        for passage in record.passages
+        for fragment in _claim_sentences(passage)
+        if specifics <= _specific_tokens(fragment) and len(claim_tokens & _content_tokens(fragment)) >= needed
+    ]
+    if not related:
+        return False
+    return not any(_polarity_matches(claim, f) and _relation_matches(claim, f) for f in related)
+
+
 def _clinical_body(response: str) -> str:
     """Exclude an optional provenance appendix from clinical-claim matching."""
     body = re.split(
@@ -1031,15 +1072,15 @@ def _on_pre_delivery(
         claim for claim in _claim_sentences(body)
         if not _claim_is_supported(state.user_message, claim, state.evidence)
     ]
+    # Solo bloquea lo objetivo: citas/cifras que no están respaldadas en la evidencia del turno, o una recomendación
+    # sobre un asunto clínico. El resto (parafrasis, consejos generales de estilo de vida, meta-frases) va con la
+    # divulgación de evidencia, no con otra ronda de reparación (regla de gates 2026-10-13).
     hard_unsupported_claims = [
         claim for claim in unsupported_claims
         if (
-            _specific_tokens(claim)
-            or _DOI_RE.search(claim)
-            or _PMID_RE.search(claim)
-            or _URL_RE.search(claim)
-            or _AUTHOR_YEAR_RE.search(claim)
-            or _RECOMMENDATION_RE.search(claim)
+            _unsupported_specifics(claim, evidence, citable)
+            or _claim_contradicted(claim, state.evidence)
+            or (_RECOMMENDATION_RE.search(claim) and _CLINICAL_RE.search(claim))
         )
     ]
     if hard_unsupported_claims:
