@@ -204,6 +204,10 @@ _NO_AUTHOR = {
 _REAL_EVIDENCE_TOOLS = {
     "web_search",
     "web_extract",
+    "mcp__exa__web_search_exa",
+    "mcp__exa__web_search_advanced_exa",
+    "mcp__exa__web_fetch_exa",
+    "mcp__exa__crawling_exa",
     "mcp__consensus__search",
     "mcp__elicit__search_papers",
     "mcp__elicit__search_trials",
@@ -261,6 +265,7 @@ class _EvidenceRecord:
     passages: tuple[str, ...]
     session_id: str
     turn_id: str
+    years: tuple[str, ...] = ()  # años que aparecen en los metadatos del resultado (fecha de publicación, título)
 
 
 @dataclass
@@ -470,6 +475,7 @@ def _append_evidence(
         passages=passages,
         session_id=session_id,
         turn_id=state.turn_id,
+        years=tuple(sorted({m.group(0) for m in _YEAR_RE.finditer(result or "")})),
     ))
     state.evidence_chars += len(fragment)
 
@@ -655,28 +661,99 @@ def _is_query_answer_echo(user_message: str, response: str, evidence: str) -> bo
     )
 
 
-def _unsupported_specifics(response: str, evidence: str) -> bool:
+_NUM_WORDS = {
+    "cero": 0, "zero": 0, "un": 1, "uno": 1, "una": 1, "one": 1, "dos": 2, "two": 2,
+    "tres": 3, "three": 3, "cuatro": 4, "four": 4, "cinco": 5, "five": 5, "seis": 6,
+    "six": 6, "siete": 7, "seven": 7, "ocho": 8, "eight": 8, "nueve": 9, "nine": 9,
+    "diez": 10, "ten": 10, "once": 11, "eleven": 11, "doce": 12, "twelve": 12,
+    "trece": 13, "catorce": 14, "quince": 15, "veinte": 20, "treinta": 30,
+}
+_UNIT_STEMS = (
+    ("milligram", "mg"), ("miligram", "mg"), ("microgram", "mcg"), ("gram", "g"),
+    ("milliliter", "ml"), ("mililitr", "ml"), ("unidad", "unit"), ("unit", "unit"),
+    ("hora", "hour"), ("hour", "hour"), ("hrs", "hour"), ("hr", "hour"), ("h", "hour"),
+    ("minut", "minute"), ("min", "minute"), ("dia", "day"), ("day", "day"),
+    ("semana", "week"), ("week", "week"), ("mes", "month"), ("month", "month"),
+    ("ano", "year"), ("year", "year"),
+)
+_QUANTITY_RE = re.compile(
+    r"\b(\d+(?:[.,]\d+)?|" + "|".join(_NUM_WORDS) + r")\s*"
+    r"(miligram\w*|milligram\w*|microgram\w*|gram\w*|mililitr\w*|milliliter\w*|"
+    r"unidad\w*|unit\w*|hora\w*|hour\w*|hrs?|h|minut\w*|min|d[ií]a\w*|day\w*|"
+    r"semana\w*|week\w*|mes(?:es)?|month\w*|año\w*|year\w*|mg|mcg|ml|g)(?=$|\W)",
+    re.IGNORECASE,
+)
+
+
+def _canonical_quantities(text: str) -> set[str]:
+    """Language-neutral "N unit" forms so "una semana" == "one week" == "1 week"."""
+    out: set[str] = set()
+    for match in _QUANTITY_RE.finditer(text or ""):
+        num = match.group(1).lower().replace(",", ".")
+        num = str(_NUM_WORDS[num]) if num in _NUM_WORDS else num
+        unit = _normalize(match.group(2))
+        canon = next((c for stem, c in _UNIT_STEMS if unit.startswith(stem)), unit)
+        out.add(f"{num} {canon}")
+    return out
+
+
+_BARE_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def _url_key(url: str) -> str:
+    """Forma comparable de una URL: sin esquema, sin 'www.', sin fragmento ni barra final, en minúsculas."""
+    key = re.sub(r"^https?://", "", (url or "").strip().rstrip(".,;:)"), flags=re.IGNORECASE)
+    key = key.split("#", 1)[0].rstrip("/")
+    return re.sub(r"^www\.", "", key, flags=re.IGNORECASE).lower()
+
+
+def _url_keys(text: str) -> set[str]:
+    return {_url_key(match.group(0)) for match in _URL_RE.finditer(text or "")}
+
+
+def _unsupported_specifics_detail(response: str, evidence: str, citable: str = "") -> list[str]:
+    """Cifras, DOI, PMID, URL o autor-año de la respuesta que NO están respaldados. ``citable`` son identificadores y
+    años de los metadatos que devolvieron las herramientas de evidencia: respaldan citas y años, nunca cifras clínicas."""
+    out: list[str] = []
     evidence_specifics = _specific_tokens(evidence)
-    for token in _specific_tokens(response):
-        if token not in evidence_specifics:
-            return True
+    evidence_quantities = _canonical_quantities(evidence)
+    citable_lower = (citable or "").lower()
+    known_urls = _url_keys(evidence) | _url_keys(citable)
+    for token in sorted(_specific_tokens(response)):
+        if token in evidence_specifics:
+            continue
+        if _BARE_YEAR_RE.match(token) and token in citable_lower:
+            continue
+        canon = _canonical_quantities(token)
+        if canon and canon <= evidence_quantities:
+            continue
+        out.append(token)
     for match in _DOI_RE.finditer(response or ""):
-        if match.group(0).lower() not in evidence.lower():
-            return True
+        doi = match.group(0).lower()
+        if doi not in evidence.lower() and doi not in citable_lower:
+            out.append(match.group(0))
     for match in _PMID_RE.finditer(response or ""):
-        if match.group(1) not in evidence:
-            return True
+        if match.group(1) not in evidence and match.group(1) not in citable_lower:
+            out.append(match.group(0))
     for match in _URL_RE.finditer(response or ""):
         url = match.group(0).rstrip(".,;:)")
-        if url not in evidence:
-            return True
+        if url in evidence or url.lower() in citable_lower or _url_key(url) in known_urls:
+            continue
+        doi_url = re.match(r"https?://(?:dx\.)?doi\.org/(10\.\S+)$", url, re.IGNORECASE)
+        if doi_url and (doi_url.group(1).lower() in evidence.lower() or doi_url.group(1).lower() in citable_lower):
+            continue
+        out.append(url)
     for match in _AUTHOR_YEAR_RE.finditer(response or ""):
         author = match.group(1)
         if author.lower() in _NO_AUTHOR:
             continue
-        if author.lower() not in evidence.lower():
-            return True
-    return False
+        if author.lower() not in evidence.lower() and author.lower() not in citable_lower:
+            out.append(match.group(0))
+    return list(dict.fromkeys(out))
+
+
+def _unsupported_specifics(response: str, evidence: str, citable: str = "") -> bool:
+    return bool(_unsupported_specifics_detail(response, evidence, citable))
 
 
 def _is_safe_degradation(response: str) -> bool:
@@ -821,6 +898,10 @@ def _claim_is_supported(
         for passage in record.passages
         for fragment in _claim_sentences(passage)
     ]
+    citable = "\n".join(
+        [identifier for record in records for identifier in record.document_ids]
+        + [year for record in records for year in record.years]
+    )
     has_exact_marker = bool(
         _specific_tokens(claim)
         or _DOI_RE.search(claim or "")
@@ -842,7 +923,7 @@ def _claim_is_supported(
         and _polarity_matches(claim, evidence)
         and _relation_matches(claim, evidence)
         and not _is_query_answer_echo(user_message, claim, evidence)
-        and not _unsupported_specifics(claim, evidence)
+        and not _unsupported_specifics(claim, evidence, citable)
         for evidence in candidates
     )
 
@@ -920,6 +1001,10 @@ def _on_pre_delivery(
     body = _clinical_body(response_text)
     passages = [passage for record in state.evidence for passage in record.passages]
     evidence = "\n".join(passages)
+    citable = "\n".join(
+        [identifier for record in state.evidence for identifier in record.document_ids]
+        + [year for record in state.evidence for year in record.years]
+    )
     reasons: list[str] = []
     if not body:
         reasons.append(
@@ -932,8 +1017,16 @@ def _on_pre_delivery(
         reasons.append("la polaridad de una afirmación contradice la evidencia recuperada")
     if body and _is_query_answer_echo(state.user_message, body, evidence):
         reasons.append("el resultado recuperado es un eco de pregunta/respuesta, no una fuente documental")
-    if body and _unsupported_specifics(body, evidence):
-        reasons.append("hay cifras, citas o identificadores que no aparecen en la evidencia recuperada")
+    if body:
+        offenders = _unsupported_specifics_detail(body, evidence, citable)
+        if offenders:
+            listed = "; ".join(offenders[:8])
+            reasons.append(
+                "hay cifras, citas o identificadores que no aparecen en la evidencia recuperada: "
+                + listed
+                + ". Cita sólo enlaces, DOI y PMID que devolvieron las herramientas en este turno; "
+                "elimina o reemplaza el resto"
+            )
     unsupported_claims = [
         claim for claim in _claim_sentences(body)
         if not _claim_is_supported(state.user_message, claim, state.evidence)

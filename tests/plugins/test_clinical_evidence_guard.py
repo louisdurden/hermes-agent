@@ -514,3 +514,82 @@ def test_pre_delivery_does_not_duplicate_existing_disclosure(plugin):
     assert decision["action"] in {"allow", "replace"}
     delivered = decision.get("response_text", candidate)
     assert delivered.count(plugin._EVIDENCE_DISCLOSURE) == 1
+
+
+_EXA_RESULT = (
+    '{"results":[{"title":"Nebivolol and exercise capacity","url":"https://pubmed.ncbi.nlm.nih.gov/1353367/",'
+    '"published_date":"2026-02-10","text":"Nebivolol did not impair exercise capacity in hypertensive patients."}]}'
+)
+_LEDGER = (
+    "\n\nFuentes declaradas\nProveedores consultados: exa\n"
+    "Limitaciones de recuperación: ninguna.\nEstado de verificación: verificado."
+)
+
+
+def _turn_with_exa(plugin, session_id):
+    plugin._on_pre_llm_call(
+        session_id=session_id,
+        user_message="¿Puedo entrenar con nebivolol por hipertensión? Indica la evidencia del tratamiento.",
+    )
+    plugin._on_post_tool_call(
+        session_id=session_id, tool_name="mcp__exa__web_search_exa", status="ok", result=_EXA_RESULT
+    )
+
+
+def test_exa_results_count_as_retrieved_evidence_and_their_urls_are_citable(plugin):
+    _turn_with_exa(plugin, "exa-ok")
+    response = (
+        "Nebivolol did not impair exercise capacity in hypertensive patients "
+        "(https://pubmed.ncbi.nlm.nih.gov/1353367/)." + _LEDGER
+    )
+    assert plugin._on_pre_delivery(session_id="exa-ok", response_text=response) == {"action": "allow"}
+
+
+def test_a_url_or_doi_no_tool_returned_is_still_blocked_and_named_in_the_repair_reason(plugin):
+    _turn_with_exa(plugin, "exa-invented")
+    response = (
+        "Nebivolol did not impair exercise capacity in hypertensive patients "
+        "(https://doi.org/10.9999/invented.2020)." + _LEDGER
+    )
+    decision = plugin._on_pre_delivery(session_id="exa-invented", response_text=response)
+    assert decision["action"] == "block"
+    assert "10.9999/invented.2020" in decision["reason"]
+
+
+def test_a_year_from_result_metadata_is_citable_but_an_unreturned_year_is_not(plugin):
+    _turn_with_exa(plugin, "exa-year")
+    ok = "Una revisión de 2026 indica que nebivolol did not impair exercise capacity in hypertensive patients." + _LEDGER
+    assert plugin._on_pre_delivery(session_id="exa-year", response_text=ok) == {"action": "allow"}
+    _turn_with_exa(plugin, "exa-year-bad")
+    bad = "Una revisión de 2031 indica que nebivolol did not impair exercise capacity in hypertensive patients." + _LEDGER
+    decision = plugin._on_pre_delivery(session_id="exa-year-bad", response_text=bad)
+    assert decision["action"] == "block" and "2031" in decision["reason"]
+
+
+def test_clinical_figures_are_never_backed_by_metadata_only(plugin):
+    _turn_with_exa(plugin, "exa-figure")
+    response = "Nebivolol did not impair exercise capacity in 40% of hypertensive patients." + _LEDGER
+    assert plugin._on_pre_delivery(session_id="exa-figure", response_text=response)["action"] == "block"
+
+
+def test_spanish_and_english_durations_are_the_same_quantity(plugin):
+    assert plugin._canonical_quantities("una semana") == plugin._canonical_quantities("one week") == {"1 week"}
+    assert plugin._unsupported_specifics_detail("durante una semana", "for one week of treatment") == []
+    assert plugin._unsupported_specifics_detail("durante dos semanas", "for one week of treatment") != []
+
+
+def test_url_citations_match_returned_urls_despite_trailing_slash_scheme_and_www(plugin):
+    result = (
+        '{"results":[{"title":"Nebivolol and exercise capacity","url":"https://pubmed.ncbi.nlm.nih.gov/1353367",'
+        '"text":"Nebivolol did not impair exercise capacity in hypertensive patients."}]}'
+    )
+    plugin._on_pre_llm_call(
+        session_id="url-norm", user_message="¿Puedo entrenar con nebivolol por hipertensión? Indica la evidencia del tratamiento."
+    )
+    plugin._on_post_tool_call(session_id="url-norm", tool_name="web_search", status="ok", result=result)
+    response = (
+        "Nebivolol did not impair exercise capacity in hypertensive patients "
+        "([PubMed](http://www.pubmed.ncbi.nlm.nih.gov/1353367/))." + _LEDGER
+    )
+    assert plugin._on_pre_delivery(session_id="url-norm", response_text=response) == {"action": "allow"}
+    assert plugin._url_key("HTTPS://www.Example.org/a/b/#frag") == "example.org/a/b"
