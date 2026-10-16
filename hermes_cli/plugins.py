@@ -145,6 +145,12 @@ VALID_HOOKS: Set[str] = {
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
+    # pre_model_route: once per real agent turn, in the executor thread of gateway/run_turn_runner.py::run_sync,
+    # AFTER the message is final (voice transcribed, queued/resumed/internal turns included) and BEFORE the
+    # turn's model/runtime is resolved. Kwargs: gateway, source, session_key, message, platform. Return values
+    # are ignored; a plugin that wants a different model for THIS turn arms a one-turn session override
+    # (the same mechanism as /model --once) before returning. Exceptions are swallowed.
+    "pre_model_route",
     "pre_gateway_dispatch", "post_gateway_admission",  # post_*: fail-open consume, gateway/run_inbound_consumer.py
     # agent_loop_stopped: an agent turn was interrupted mid-run (/stop, or the running-agent
     # fast-path of /new; see gateway/run.py::_interrupt_and_clear_session). Kwargs: session_key,

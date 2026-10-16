@@ -1906,6 +1906,16 @@ class TurnRunner:
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
         try:
+            # Plugin hook: lets a plugin arm a one-turn model override for THIS turn (voice, queued and
+            # resumed turns never pass pre_gateway_dispatch with a usable text). Best-effort, never blocks the turn.
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "pre_model_route", gateway=runner, source=ctx.source, session_key=ctx.session_key,
+                message=ctx.message, platform=platform_key,
+            )
+        except Exception:
+            logger.debug("pre_model_route hook failed", exc_info=True)
+        try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
             )
