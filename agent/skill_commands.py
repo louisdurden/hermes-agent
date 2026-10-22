@@ -237,7 +237,21 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     except Exception:
         return None
     if not loaded_skill.get("success"):
-        return None
+        # Review dispatch force-loads this runtime dependency. Curator may
+        # archive the installed copy; fresh workers must still get the bundled
+        # review contract. Never override an explicit disable or ambiguity.
+        if (normalized != "sdlc-review" or not os.getenv("HERMES_KANBAN_TASK")
+                or loaded_skill.get("error") != "Skill 'sdlc-review' not found."):
+            return None
+        from agent.skill_utils import get_disabled_skill_names
+        if {"sdlc-review", "devops/sdlc-review"} & get_disabled_skill_names():
+            return None
+        skill_dir = Path(__file__).resolve().parent.parent / "skills" / "devops" / "sdlc-review"
+        try:
+            content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return ({"success": True, "name": "sdlc-review", "content": content}, skill_dir, "sdlc-review")
     skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None
     # Prefer the absolute skill_dir from skill_view() (correct for external
