@@ -160,3 +160,20 @@ def test_dispatch_does_not_repromote_or_spawn_stalled_card(board, monkeypatch):
     )
     assert all(item[0] != task_id and item[1] == "default" for item in result.spawned)
     assert kb.get_task(board, task_id).status == "blocked"
+
+
+@pytest.mark.parametrize('terminal', ['done', 'archived', 'blocked'])
+def test_legacy_alerts_archive_and_only_active_origins_reach_brief(board, terminal):
+    origin = kb.create_task(board, title='origin', assignee='fleetcontent')
+    alert = kb.create_task(board, title='Alfred: budget_exceeded '+origin,
+                           assignee='default', created_by='alfred-tree-policy')
+    unrelated = kb.create_task(board, title='unrelated', assignee='fleetcontent')
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET status=? WHERE id=?', (terminal, origin))
+        board.execute("UPDATE tasks SET status='blocked' WHERE id=?", (alert,))
+    assert progress.reconcile_alerts(board) == [alert]
+    assert progress.reconcile_alerts(board) == []
+    assert kb.get_task(board, alert).status == 'archived'
+    assert kb.list_comments(board, alert)
+    assert kb.get_task(board, unrelated).status == 'ready'
+    assert (origin in progress.active_alert_summary(board)) == (terminal == 'blocked')

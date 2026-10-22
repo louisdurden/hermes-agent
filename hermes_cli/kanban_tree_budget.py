@@ -141,6 +141,9 @@ def notify_alfred(conn, root_id, reason, details):
     with kb.write_txn(conn):
         conn.execute('INSERT OR REPLACE INTO fleet_supervisor_inbox VALUES (?,?)', (key, body))
     _flush_inbox(conn)
+    # Budget alerts are durable brief notifications, never runnable tasks.
+    if reason == "budget_exceeded":
+        return
     if conn.execute('SELECT 1 FROM tasks WHERE idempotency_key=?', (key,)).fetchone():
         return
     if conn.execute("SELECT 1 FROM tasks WHERE id=? AND created_by='alfred-tree-policy'", (root_id,)).fetchone():
@@ -183,7 +186,7 @@ def enforce(conn, *, now=None, signal_fn=None):
             conn.execute('UPDATE kanban_tree_budgets SET exceeded=1 WHERE root_id=?', (root,))
             for task_id in used['task_ids']:
                 row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
-                if task_id == root or row['status'] not in {'done', 'archived'}:
+                if row['status'] not in {'done', 'archived'}:
                     conn.execute("UPDATE tasks SET status='blocked', block_kind='budget_exceeded', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?", (task_id,))
                     kb._end_run(conn, task_id, outcome='budget_exceeded', status='blocked', summary='budget_exceeded')
             if not cap['exceeded']:

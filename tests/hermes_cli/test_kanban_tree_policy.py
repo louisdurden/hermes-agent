@@ -261,4 +261,17 @@ def test_budget_notification_retries_after_crash(conn, monkeypatch):
     monkeypatch.setattr(budget, 'notify_alfred', notify)
     budget.enforce(conn)
     budget.enforce(conn)
-    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key=?", ('budget_exceeded-'+root,)).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key=?", ('budget_exceeded-'+root,)).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM fleet_supervisor_inbox WHERE key=?", ('budget_exceeded-'+root,)).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('terminal', ['done', 'archived'])
+def test_budget_enforcement_does_not_resurrect_terminal_root(conn, terminal):
+    root = kb.create_task(conn, title='completed diagnosis', body='budget_tokens: 1')
+    run = kb.claim_task(conn, root)
+    budget.record_usage(conn, root, run.current_run_id, 2)
+    with kb.write_txn(conn):
+        kb._end_run(conn, root, outcome='completed', status='done')
+        conn.execute('UPDATE tasks SET status=? WHERE id=?', (terminal, root))
+    budget.enforce(conn)
+    assert kb.get_task(conn, root).status == terminal

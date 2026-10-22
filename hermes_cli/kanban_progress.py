@@ -133,20 +133,65 @@ def _park_stalled(
         body = json.dumps({"recipient": "alfred", "task_id": task["id"], "assignee": task["assignee"],
                            "reason": "stalled", "observed_at": now})
         conn.execute("INSERT OR IGNORE INTO fleet_supervisor_inbox VALUES (?, ?)", (key, body))
-    # A standalone Kanban worker has no requester delivery route. Alert Alfred
-    # through his queue, never through a cron whose output goes to Telegram.
-    if task["created_by"] != _SUPERVISOR:
-        kb.create_task(
-            conn, title="Alfred: diagnose stalled task " + task["id"], assignee="default",
-            created_by=_SUPERVISOR, board=FLEET_BOARD, idempotency_key=key,
-            body="task_type: research\nresource_key: " + key + "\n"
-                 "Internal supervisor notice for Alfred only: task " + task["id"] + " is stalled. "
-                 "Inspect its events, comments and artifacts; record the confirmed diagnosis "
-                 "as a comment and a durable local artifact. Do not send messages, publish, "
-                 "modify profiles or notify Rodrigo. Do not retry external effects. "
-                 "Complete with result JSON artifact_path. Preserve uncertainty.",
-        )
+    # Durable inbox notices are rendered in the brief; never dispatch alert workers.
     return True
+
+
+def reconcile_alerts(conn, *, now=None):
+    """Archive legacy default-profile alerts; preserve live origins in the brief inbox."""
+    from hermes_cli import kanban_db as kb
+    now = int(time.time()) if now is None else now
+    _ensure_schema(conn)
+    changed = []
+    rows = conn.execute("SELECT * FROM tasks WHERE assignee='default' AND "
+        "created_by IN ('alfred-tree-policy','alfred-progress-watchdog') "
+        "AND status NOT IN ('archived','running')").fetchall()
+    for row in rows:
+        import re
+        match = re.fullmatch(r"Alfred: (?:budget_exceeded|diagnose stalled task) (t_[a-z0-9]+)", row['title'])
+        if not match:
+            continue
+        origin = match[1]
+        source = conn.execute('SELECT status FROM tasks WHERE id=?', (origin,)).fetchone()
+        resolved = source and source[0] in ('done', 'archived')
+        reason = ('Origen '+origin+' cerrado; alerta obsoleta.' if resolved else
+                  'Aviso de '+origin+' trasladado al brief; no requiere worker de alerta.')
+        with kb.write_txn(conn):
+            if not conn.execute("UPDATE tasks SET status='archived', block_kind=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? "
+                "AND status NOT IN ('archived','running')", (row['id'],)).rowcount:
+                continue
+            kb._end_run(conn, row['id'], outcome='reclaimed', status='reclaimed', summary=reason)
+            kb._insert_comment(conn, row['id'], 'alfred', reason, now)
+            kb._append_event(conn, row['id'], 'archived', {'reason':reason, 'origin':origin})
+            if not resolved:
+                body = json.dumps({'recipient':'alfred', 'task_id':origin,
+                                   'reason':'budget_exceeded' if 'budget_exceeded' in row['title'] else 'stalled'})
+                conn.execute('INSERT OR IGNORE INTO fleet_supervisor_inbox VALUES (?,?)',
+                             (row['idempotency_key'] or 'legacy-'+row['id'], body))
+        changed.append(row['id'])
+    return changed
+
+
+def active_alert_summary(conn):
+    """Bounded deterministic brief notification, deduplicated by origin and reason."""
+    active = set()
+    for row in conn.execute('SELECT body FROM fleet_supervisor_inbox'):
+        try:
+            notice = json.loads(row[0])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(notice, dict) or notice.get('reason') not in ('stalled','budget_exceeded'):
+            continue
+        origin = notice.get('task_id')
+        source = conn.execute('SELECT status FROM tasks WHERE id=?', (origin,)).fetchone()
+        if source and source[0] not in ('done','archived'):
+            active.add((origin, notice['reason']))
+    if not active:
+        return ''
+    items = sorted(active)
+    return 'Alfred: avisos de flota ('+str(len(items))+'): '+', '.join(
+        task+' / '+reason for task, reason in items[:20]) + ('; resto en inbox local' if len(items)>20 else '')
 
 
 def _daily_summary(conn: sqlite3.Connection, now: int) -> None:
@@ -190,6 +235,7 @@ def observe_progress(conn: sqlite3.Connection, *, now: int | None = None) -> lis
     from hermes_cli import kanban_db as kb
     now = int(time.time()) if now is None else now
     _ensure_schema(conn)
+    reconcile_alerts(conn, now=now)
     heartbeat = _heartbeat_seconds()
     stalled = []
     for task in conn.execute("SELECT * FROM tasks WHERE status = 'running'").fetchall():
@@ -237,4 +283,4 @@ def render_supervisor_context(job_id: str) -> str:
             return ""
         day = datetime.fromtimestamp(time.time(), timezone.utc).date().isoformat()
         row = conn.execute("SELECT body FROM fleet_supervisor_inbox WHERE key = ?", (f"daily-{day}",)).fetchone()
-        return row[0] if row else ""
+        return "\n".join(filter(None, [row[0] if row else "", active_alert_summary(conn)]))
