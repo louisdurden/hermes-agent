@@ -173,7 +173,11 @@ def enforce(conn, *, now=None, signal_fn=None):
             used = consumption(conn, root, now=now)
             ratio = max(used['tokens'] / cap['budget_tokens'], used['seconds'] / cap['budget_seconds'])
             warn(conn, root, cap, used, now)
-            exceeded = bool(cap['exceeded'] or ratio > 1)
+            if cap['exceeded'] and ratio <= 1:
+                # Raising the cap is the owner's decision; the sticky flag must not outlive it.
+                conn.execute('UPDATE kanban_tree_budgets SET exceeded=0, warned=0 WHERE root_id=?', (root,))
+                continue
+            exceeded = ratio > 1
             if not exceeded:
                 continue
             conn.execute('UPDATE kanban_tree_budgets SET exceeded=1 WHERE root_id=?', (root,))
