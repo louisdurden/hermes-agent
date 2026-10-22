@@ -509,11 +509,9 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     fingerprint: a legacy row (NULL fingerprint) or a recycled PID is never
     signalled; a pid that is simply gone just has its evidence cleared. A run
     that ended less than ``TERMINAL_WORKER_REAP_GRACE_SECONDS`` ago is left
-    alone so a worker still finalising after its own transition is not killed.
-    One row's failure (signal, /proc probe) is logged and skips only that row.
-    Returns the task ids whose worker was terminated."""
+    alone for worker finalisation. Probe failures skip that row; returns terminated task ids."""
     rows = conn.execute(
-        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
+        "SELECT id, task_id, worker_pid, worker_started_at, claim_lock, summary FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
         "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
@@ -539,6 +537,8 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
     alive = _worker_alive(pid, fingerprint)
     termination = None
+    if alive and str(row["summary"] or "").startswith("stalled:"):
+        return  # The independent budget gate owns termination of parked workers.
     if alive:
         termination = _terminate_reclaimed_worker(
             pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)

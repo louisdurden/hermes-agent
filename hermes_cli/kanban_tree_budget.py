@@ -76,6 +76,19 @@ def limits(conn, root_id):
     return dict(conn.execute('SELECT * FROM kanban_tree_budgets WHERE root_id=?', (root_id,)).fetchone())
 
 
+
+def _run_elapsed(row, now):
+    end = row['ended_at']
+    # A watchdog can park a card while its worker remains alive. Its time
+    # budget must keep running until that process exits or the budget stops it.
+    if end is not None and str(row['summary'] or '').startswith('stalled:'):
+        from hermes_cli import kanban_db as kb
+        if (str(row['claim_lock'] or '').startswith(kb._host_prefix())
+                and kb._worker_alive(row['worker_pid'], row['worker_started_at'])):
+            end = None
+    return max(0, (now if end is None else end) - row['started_at'])
+
+
 def consumption(conn, root_id, *, now=None):
     ensure_schema(conn)
     now = int(time.time()) if now is None else now
@@ -83,7 +96,7 @@ def consumption(conn, root_id, *, now=None):
     runs = [row for row in conn.execute('SELECT * FROM task_runs') if row['task_id'] in ids]
     usage = [row for row in conn.execute('SELECT * FROM kanban_run_usage') if row['task_id'] in ids]
     tokens = sum(row['tokens'] for row in usage)
-    seconds = sum(max(0, (row['ended_at'] if row['ended_at'] is not None else now) - row['started_at']) for row in runs)
+    seconds = sum(_run_elapsed(row, now) for row in runs)
     metered = {row['run_id'] for row in usage}
     return {'tokens': tokens, 'seconds': seconds, 'task_ids': sorted(ids),
             'missing_usage_calls': sum(row['missing_usage'] for row in usage),

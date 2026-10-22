@@ -34,12 +34,12 @@ def test_two_progress_heartbeats_ignore_worker_keepalives_and_resume_after_resta
     task_id = running(board)
     assert progress.observe_progress(board, now=1000) == []
     dispatch.heartbeat_worker(board, task_id, note="still alive")
-    assert progress.observe_progress(board, now=1059) == []
-    assert progress.observe_progress(board, now=1060) == []
+    assert progress.observe_progress(board, now=1299) == []
+    assert progress.observe_progress(board, now=1300) == []
     # New connection simulates a dispatcher restart; snapshots stay durable.
     other = kbc.connect()
     try:
-        assert progress.observe_progress(other, now=1120) == [task_id]
+        assert progress.observe_progress(other, now=1600) == [task_id]
     finally:
         other.close()
     task = kb.get_task(board, task_id)
@@ -51,7 +51,7 @@ def test_two_progress_heartbeats_ignore_worker_keepalives_and_resume_after_resta
     inbox = tmp_path / "kanban" / "supervisor-inbox" / "alfred-fleet"
     notice = json.loads(next(inbox.glob("stalled-*.json")).read_text())
     assert notice["recipient"] == "alfred" and notice["task_id"] == task_id
-    assert progress.observe_progress(board, now=1180) == []
+    assert progress.observe_progress(board, now=1900) == []
     assert len(list(inbox.glob("stalled-*.json"))) == 1
 
 
@@ -60,14 +60,14 @@ def test_comments_and_artifact_stat_changes_reset_idle_heartbeat(board, tmp_path
     artifact.write_text("first")
     task_id = running(board, body=f"artifact_path: {artifact}")
     progress.observe_progress(board, now=1000)
-    progress.observe_progress(board, now=1060)
+    progress.observe_progress(board, now=1300)
     kb.add_comment(board, task_id, "fleetliterature", "Source reviewed")
-    assert progress.observe_progress(board, now=1120) == []
-    progress.observe_progress(board, now=1180)
+    assert progress.observe_progress(board, now=1600) == []
+    progress.observe_progress(board, now=1900)
     artifact.write_text("a changed result")
-    assert progress.observe_progress(board, now=1240) == []
-    assert progress.observe_progress(board, now=1300) == []
-    assert progress.observe_progress(board, now=1360) == [task_id]
+    assert progress.observe_progress(board, now=2200) == []
+    assert progress.observe_progress(board, now=2500) == []
+    assert progress.observe_progress(board, now=2800) == [task_id]
 
 
 def test_daily_summary_groups_old_blocks_once_and_keeps_new_blocks_out(board, tmp_path):
@@ -136,7 +136,7 @@ def test_dispatch_respects_assignee_profile_limit_and_fleet_cap(board, tmp_path,
 def test_progress_arriving_between_observation_and_park_wins(board, monkeypatch):
     task_id = running(board)
     progress.observe_progress(board, now=1000)
-    progress.observe_progress(board, now=1060)
+    progress.observe_progress(board, now=1300)
     original = progress._park_stalled
 
     def park_after_comment(conn, task, now, expected_signature=None):
@@ -144,15 +144,15 @@ def test_progress_arriving_between_observation_and_park_wins(board, monkeypatch)
         return original(conn, task, now, expected_signature)
 
     monkeypatch.setattr(progress, "_park_stalled", park_after_comment)
-    assert progress.observe_progress(board, now=1120) == []
+    assert progress.observe_progress(board, now=1600) == []
     assert kb.get_task(board, task_id).status == "running"
 
 
 def test_dispatch_does_not_repromote_or_spawn_stalled_card(board, monkeypatch):
     task_id = running(board)
     progress.observe_progress(board, now=1000)
-    progress.observe_progress(board, now=1060)
-    assert progress.observe_progress(board, now=1120) == [task_id]
+    progress.observe_progress(board, now=1300)
+    assert progress.observe_progress(board, now=1600) == [task_id]
     monkeypatch.setattr(dispatch, "_memory_pressure_level", lambda: "ok")
     result = dispatch.dispatch_once(
         board, board="alfred-fleet", reconcile_orphans=False,

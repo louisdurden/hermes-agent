@@ -1,6 +1,6 @@
 """Fleet supervision on the existing dispatcher tick, without user notifications.
 
-A progress heartbeat is one observation at least 60 seconds after the previous
+A progress heartbeat is one observation at least 300 seconds after the previous
 observation, independent of worker keepalives or a faster dispatch interval.
 Two unchanged heartbeats park a task; the first observation only sets a baseline.
 Alfred consumes durable records in ``kanban/supervisor-inbox``; nothing is sent
@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FLEET_BOARD = "alfred-fleet"
-PROGRESS_HEARTBEAT_SECONDS = 60
+PROGRESS_HEARTBEAT_SECONDS = 300
 _SUPERVISOR = "alfred-progress-watchdog"
 _IGNORED_EVENTS = ("heartbeat", "progress_observed", "progress_stalled")
 _PATH_RE = re.compile(r"(?<!\w)(?:~/|/)[^\s<>\"`]+")
@@ -41,6 +41,41 @@ def _artifact_signature(conn: sqlite3.Connection, task: sqlite3.Row) -> list:
     return stats
 
 
+def _heartbeat_seconds() -> int:
+    from hermes_cli.config_effective import load_user_config_effective
+    value = load_user_config_effective().get("kanban", {}).get("stall_heartbeat_seconds", PROGRESS_HEARTBEAT_SECONDS)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return PROGRESS_HEARTBEAT_SECONDS
+
+
+def _worker_dead(task: sqlite3.Row) -> bool:
+    from hermes_cli import kanban_db as kb
+    # Foreign hosts cannot be probed locally; a claim awaiting spawn has no PID yet.
+    return bool(task["worker_pid"] and (task["claim_lock"] or "").startswith(kb._host_prefix())
+                and not kb._worker_alive(task["worker_pid"], task["worker_started_at"]))
+
+
+def _worker_signature(conn: sqlite3.Connection, task: sqlite3.Row) -> tuple:
+    from hermes_cli import kanban_db as kb
+    if not task["worker_pid"] or not (task["claim_lock"] or "").startswith(kb._host_prefix()):
+        return ()
+    if not kb._worker_alive(task["worker_pid"], task["worker_started_at"]):
+        return ()
+    usage = None
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'kanban_run_usage'").fetchone():
+        row = conn.execute("SELECT tokens, missing_usage FROM kanban_run_usage WHERE run_id = ?",
+                           (task["current_run_id"],)).fetchone()
+        usage = tuple(row) if row else None
+    try:
+        stat = kb.worker_log_path(task["id"], board=FLEET_BOARD).stat()
+        log = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        log = None
+    return (usage, log)
+
+
 def _signature(conn: sqlite3.Connection, task: sqlite3.Row) -> str:
     event = conn.execute(
         "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ? "
@@ -52,7 +87,7 @@ def _signature(conn: sqlite3.Connection, task: sqlite3.Row) -> str:
         "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ? AND author != ?",
         (task["id"], _SUPERVISOR),
     ).fetchone()[0]
-    data = (task["current_run_id"], task["started_at"], event, comment, _artifact_signature(conn, task))
+    data = (task["current_run_id"], task["started_at"], event, comment, _artifact_signature(conn, task), _worker_signature(conn, task))
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
@@ -70,7 +105,9 @@ def _park_stalled(
     conn: sqlite3.Connection, task: sqlite3.Row, now: int, expected_signature: str | None = None,
 ) -> bool:
     from hermes_cli import kanban_db as kb
-    reason = "stalled: two 60-second progress heartbeats without a new event, comment or artifact change"
+    reason = ("stalled: worker process died without closing" if _worker_dead(task) else
+              f"stalled: two {_heartbeat_seconds()}-second progress heartbeats without worker activity, "
+              "new event, comment or artifact change")
     with kb.write_txn(conn):
         current = conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
         if current is None or current["status"] != "running":
@@ -153,17 +190,19 @@ def observe_progress(conn: sqlite3.Connection, *, now: int | None = None) -> lis
     from hermes_cli import kanban_db as kb
     now = int(time.time()) if now is None else now
     _ensure_schema(conn)
+    heartbeat = _heartbeat_seconds()
     stalled = []
     for task in conn.execute("SELECT * FROM tasks WHERE status = 'running'").fetchall():
         previous = conn.execute("SELECT * FROM fleet_progress_snapshots WHERE task_id = ?", (task["id"],)).fetchone()
-        if previous and now - previous["observed_at"] < PROGRESS_HEARTBEAT_SECONDS:
+        dead = _worker_dead(task)
+        if not dead and previous and now - previous["observed_at"] < heartbeat:
             continue
         signature = _signature(conn, task)
         idle = previous["idle_beats"] + 1 if previous and previous["signature"] == signature else 0
         with kb.write_txn(conn):
             conn.execute("INSERT OR REPLACE INTO fleet_progress_snapshots VALUES (?, ?, ?, ?)",
                          (task["id"], signature, now, idle))
-        if idle >= 2 and _park_stalled(conn, task, now, signature):
+        if (dead or idle >= 2) and _park_stalled(conn, task, now, signature):
             stalled.append(task["id"])
     with kb.write_txn(conn):
         conn.execute("DELETE FROM fleet_progress_snapshots WHERE task_id NOT IN (SELECT id FROM tasks WHERE status = 'running')")
