@@ -54,10 +54,13 @@ KANBAN_SHOW_SCHEMA = _schema(
         "pre-formatted ``worker_context`` string suitable for inclusion "
         "verbatim in your reasoning. Outside a dispatcher-spawned worker "
         "there is no default task: a bare call returns a pointer to "
-        "``kanban_list`` instead of task state."
+        "``kanban_list`` instead of task state. Compact by default (last 5 "
+        "comments, last 15 events, text clipped to ~300 chars); pass ``full=true`` "
+        "only if you need every comment or complete run metadata."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "full": _prop("boolean", "Return all comments and unclipped events/runs. Defaults to false."),
     },
     [],
 )

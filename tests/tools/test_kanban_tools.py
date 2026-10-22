@@ -71,6 +71,21 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def test_show_compact_by_default_and_full_on_request(worker_env):
+    from tools import kanban_tools as kt
+    for i in range(8):
+        kt._handle_comment({"task_id": worker_env, "body": f"c{i} " + "x" * 600})
+    compact = json.loads(kt._handle_show({}))
+    bodies = [c for c in compact["comments"] if "body" in c]
+    assert len(bodies) == 5 and compact["comments"][0] == {"omitted_older_comments": 3}
+    assert all(len(c["body"]) < 350 for c in bodies)
+    assert bodies[-1]["body"].startswith("c7 ")
+    assert "worker_context" in compact and "runs" in compact
+    full = json.loads(kt._handle_show({"full": True}))
+    assert len(full["comments"]) == 8 and all(len(c["body"]) > 600 for c in full["comments"])
+    assert len(json.dumps(compact)) < len(json.dumps(full))
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})

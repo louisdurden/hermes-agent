@@ -659,9 +659,40 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+_SHOW_COMPACT_COMMENTS = 5
+_SHOW_COMPACT_EVENTS = 15
+_SHOW_COMPACT_CHARS = 300
+
+
+def _clip(value: Any, limit: int = _SHOW_COMPACT_CHARS) -> Any:
+    """Cut long text/JSON values to ``limit`` chars for the compact kanban_show view."""
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return text if len(text) <= limit else text[:limit] + f"… [+{len(text) - limit} chars; full=true]"
+
+
+def _compact_show(kb, conn, tid: str) -> tuple[list, list, list]:
+    """Comments (last 5), events (last 15) and runs trimmed for the default kanban_show."""
+    comments = kb.list_comments(conn, tid)
+    shown = [dict(_fields(c, _COMMENT_FIELDS), body=_clip(c.body)) for c in comments[-_SHOW_COMPACT_COMMENTS:]]
+    if len(comments) > len(shown):
+        shown.insert(0, {"omitted_older_comments": len(comments) - len(shown)})
+    all_events = kb.list_events(conn, tid)
+    events = [dict(_fields(e, _EVENT_FIELDS), payload=_clip(e.payload)) for e in all_events[-_SHOW_COMPACT_EVENTS:]]
+    if len(all_events) > len(events):
+        events.insert(0, {"omitted_older_events": len(all_events) - len(events)})
+    runs = [{**{n: getattr(r, n) for n in ("id", "profile", "status", "outcome", "started_at", "ended_at")},
+             "summary": _clip(r.summary), "error": _clip(r.error)} for r in kb.list_runs(conn, tid)]
+    return shown, events, runs
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Task state: row, parents, children, comments, runs, last 50 events.
+
+    Compact by default (last 5 comments, last 15 events, events/runs clipped to ~300 chars); ``full=true`` returns everything."""
+    full = _parse_bool_arg(args, "full")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
@@ -676,6 +707,13 @@ def _handle_show(args: dict, **kw) -> str:
         })
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        if full:
+            comments = [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)]
+            # Capped; full log via CLI.
+            events = [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]]
+            runs = [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)]
+        else:
+            comments, events, runs = _compact_show(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
@@ -684,10 +722,7 @@ def _handle_show(args: dict, **kw) -> str:
             "unsatisfied_parents": [
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+            "comments": comments, "events": events, "runs": runs,
             # Same string build_worker_context hands the dispatcher at spawn time.
             "worker_context": kb.build_worker_context(conn, tid)})
 
