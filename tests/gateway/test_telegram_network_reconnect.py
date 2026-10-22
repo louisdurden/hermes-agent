@@ -77,7 +77,7 @@ async def test_reconnect_self_schedules_on_start_polling_failure():
 
 
 @pytest.mark.asyncio
-async def test_retry_exhaustion_queues_reconnect_before_child_disconnect(tmp_path):
+async def test_polling_stall_queues_reconnect_before_child_disconnect(tmp_path):
     """Fatal teardown must not cancel the gateway's reconnect handoff.
 
     The gateway runs ``disconnect()`` in a bounded child task.  If the current
@@ -92,14 +92,14 @@ async def test_retry_exhaustion_queues_reconnect_before_child_disconnect(tmp_pat
         sessions_dir=tmp_path / "sessions",
     )
     runner = GatewayRunner(config)
+    runner.stop = AsyncMock()
     adapter = _make_adapter()
-    adapter._polling_network_error_count = 10  # MAX_NETWORK_RETRIES
     adapter.set_fatal_error_handler(runner._handle_adapter_fatal_error)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.delivery_router.adapters = runner.adapters
 
     recovery_task = asyncio.create_task(
-        adapter._handle_polling_network_error(Exception("still failing"))
+        adapter._handle_polling_network_error(tg_adapter._PollingStallError("polling stalled"))
     )
     adapter._polling_error_task = recovery_task
     result = await asyncio.gather(recovery_task, return_exceptions=True)
@@ -108,6 +108,7 @@ async def test_retry_exhaustion_queues_reconnect_before_child_disconnect(tmp_pat
     assert runner.adapters == {}
     assert Platform.TELEGRAM in runner._failed_platforms
     assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
+    runner.stop.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

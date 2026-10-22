@@ -452,15 +452,14 @@ _INITIAL_POLLING_PROGRESS_TIMEOUT = 60.0
 # ladder always advances toward the fatal-restart escalation. Matches _UPDATER_STOP_TIMEOUT. Refs:
 # NousResearch/hermes-agent#66377
 _DRAIN_TIMEOUT = 15.0
-# Wedged-recovery watchdog: healthy worst case is stop + 2x drain + start + 60s backoff ≈ 135s, so
-# 300s in flight is unambiguously stuck and the heartbeat force-escalates.
+# Wedged-recovery watchdog includes the 300s backoff plus time for bounded stop/drain/start.
 # Every recovery path (the reconnect ladder's re-entry, the pending-update probe, PTB's error callback)
 # gates new recovery on ``_polling_error_task.done()``; if that task ever wedges on a hung await that no
 # local bound covers, the whole gateway goes silently deaf with nothing retrying. The heartbeat loop
 # force-escalates a recovery task that stays in-flight far longer than any healthy ladder attempt could take
 # — stop (_UPDATER_STOP_TIMEOUT) + drain (2x_DRAIN_TIMEOUT) + start (_UPDATER_START_TIMEOUT) + max backoff
-# (60s) is ~135s, so 300s is unambiguously stuck. See #66377.
-_POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
+# (300s) is ~375s, so 600s is unambiguously stuck. See #66377.
+_POLLING_ERROR_TASK_STUCK_TIMEOUT = 600.0
 _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates returns; exceeds one idle long-poll
 # Telegram answers a long-poll within ~50s; no round-trip for ~3x that while get_me() is healthy and
 # nothing is queued means a consumer wedged on a socket that never raises (CLOSE-WAIT behind a route flip).
@@ -474,7 +473,7 @@ _POLLING_STALL_TIMEOUT = 150.0
 # Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
 # that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
 # four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
-# wedged dispatcher). Sized past _POLLING_ERROR_TASK_STUCK_TIMEOUT (300s), the bound on a slow handler: updates
+# wedged dispatcher). Independent of the transport recovery watchdog: updates
 # of one chat still dispatch in order (PerChatUpdateProcessor), so e.g. a sticker vision_analyze (120s default)
 # must not trip it. Re-arms on progress.
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 4
@@ -1234,7 +1233,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 return True
         except ImportError:
             pass
-        return isinstance(error, OSError)
+        import httpx
+        return isinstance(error, (OSError, httpx.NetworkError, httpx.TimeoutException))
 
     @staticmethod
     def _exception_graph_matches(error: Exception, name_marker: str, *text_markers: str) -> bool:
@@ -2024,8 +2024,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption (NetworkError/TimedOut).
 
-        Host connectivity loss (sleep, WiFi switch, VPN) kills the long-poll silently. Exponential back-off (5s→60s
-        cap) up to MAX_NETWORK_RETRIES, then retryable-fatal so the supervisor restarts the gateway.
+        Host connectivity loss (sleep, WiFi switch, VPN) kills the long-poll silently. Retry indefinitely
+        with exponential backoff (5s to 300s), keeping cron and other gateway work alive during outages.
 
         A confirmed polling stall (``_PollingStallError``) skips the ladder entirely: the Updater's long-poll
         action never quiesced, so it is handed to the supervisor for a rebuild before any backoff."""
@@ -2040,22 +2040,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             )
             await self._go_fatal_network(message, "[%s] %s (rebuilding adapter via supervisor)", self.name, message)
             return
-        MAX_NETWORK_RETRIES = 10
         BASE_DELAY = 5
-        MAX_DELAY = 60
+        MAX_DELAY = 300
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
-        if attempt > MAX_NETWORK_RETRIES:
-            message = (
-                "Telegram polling could not reconnect after %d network error retries. "
-                "Escalating to gateway recovery." % MAX_NETWORK_RETRIES)
-            await self._go_fatal_network(message, "[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error))
-            return
-        delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
+        delay = min(BASE_DELAY * (2 ** min(attempt - 1, 6)), MAX_DELAY)
         logger.warning(
-            "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s", self.name, attempt,
-            MAX_NETWORK_RETRIES, delay, _redact_telegram_error_text(error))
+            "[%s] Telegram network error (attempt %d), reconnecting in %ds. Error: %s", self.name, attempt,
+            delay, _redact_telegram_error_text(error))
         await asyncio.sleep(delay)
         if self._teardown_started:
             return
@@ -2084,6 +2077,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return
         except Exception as retry_err:
             if self._teardown_started:
+                return
+            if self._looks_like_auth_error(retry_err):
+                self._set_fatal_error("telegram_auth_error", _redact_telegram_error_text(retry_err), retryable=False)
+                await self._handoff_polling_fatal_error()
                 return
             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, _redact_telegram_error_text(retry_err))
             # Polling is dead and no more error callbacks will fire — chain the retry ourselves.

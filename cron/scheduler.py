@@ -2517,7 +2517,7 @@ class _FireAudit:
             "total_tokens": result.get("total_tokens"),
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
-            "model": self.model or None,
+            "model": result.get("served_model") or result.get("model") or self.model or None,
             "duration_ms": int((time.monotonic() - self.t_start) * 1000),
             "error": error})
 
