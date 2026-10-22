@@ -23,7 +23,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-TASK_TYPES = {"send_email", "publish_post", "listing", "code_change", "research", "generic"}
+TASK_TYPES = {"send_email", "publish_post", "listing", "code_change", "research", "generic", "skill_change", "review"}
 
 
 def fields(text):
@@ -37,7 +37,11 @@ def fields(text):
 
 
 def validate_task_body(body):
-    declared = fields(body).get("task_type")
+    values = fields(body)
+    for key in ("budget_tokens", "budget_seconds"):
+        if key in values and int(values[key]) <= 0:
+            raise ValueError(key + " must be positive")
+    declared = values.get("task_type")
     if declared is not None and declared not in TASK_TYPES:
         raise ValueError("task_type must be one of " + ", ".join(sorted(TASK_TYPES)))
 
@@ -131,6 +135,8 @@ _VERIFIERS = {
     "publish_post": (_post_evidence, "publication_id or reachable url"),
     "listing": (lambda task, result, ev: reachable_url(ev.get("url", "")), "reachable profile url"),
     "code_change": (lambda task, result, ev: remote_commit(ev), "full commit_sha advertised by HTTPS remote_url"),
+    "skill_change": (lambda task, result, ev: bool(ev.get("diff") and ev.get("regression")), "diff and regression evidence"),
+    "review": (lambda task, result, ev: ev.get("verdict") in {"PASS", "FAIL", "NO_VERIFICADO"} and bool(ev.get("proof")), "verdict and primary proof"),
     "research": (_artifact_evidence, "existing artifact_path outside disposable scratch; attach it durably"),
     "generic": (_artifact_evidence, "existing artifact_path outside disposable scratch or reachable url"),
 }
@@ -150,6 +156,9 @@ def verify_evidence(task, result):
 def gate_completion(conn, task_id, result, expected_run_id, force, metadata=None):
     from hermes_cli import kanban_db as kb
 
+    from hermes_cli.kanban_tree_budget import allowed
+    if not allowed(conn, task_id):
+        return False
     task = kb.get_task(conn, task_id)
     if task is None or not applies(conn, task):
         return True
@@ -162,7 +171,8 @@ def gate_completion(conn, task_id, result, expected_run_id, force, metadata=None
     candidate = result if result is not None else task.result
     reason = "schema_valid=false" if (metadata or {}).get("schema_valid") is False else verify_evidence(task, candidate)
     if reason is None:
-        return True
+        from hermes_cli.kanban_cross_review import gate
+        return gate(conn, task, candidate)
     with kb.write_txn(conn):
         current = kb.get_task(conn, task_id)
         if current != task:
@@ -179,6 +189,9 @@ def enforce_resource_owner(conn, task_id):
     """Called within creation/assignment/claim transactions, serializing rivals."""
     from hermes_cli import kanban_db as kb
 
+    from hermes_cli.kanban_cross_review import managed_original
+    if managed_original(conn, task_id) and kb.get_task(conn, task_id).status == "review":
+        return False
     task = kb.get_task(conn, task_id)
     if task is None or task.status in {"done", "archived"}:
         return True
@@ -260,8 +273,17 @@ def append_evidence_context(lines, conn, task):
 def prepare_edit(conn, task_id, body, result):
     from hermes_cli import kanban_db as kb
     task = kb.get_task(conn, task_id)
-    if task is None or task.status != "done":
+    if task is None:
         return None
+    from hermes_cli.kanban_cross_review import REVIEW_TYPES
+    kind = fields(task.body).get("task_type")
+    if kind in REVIEW_TYPES | {"review"}:
+        if body is not None and fields(body).get("task_type") != kind:
+            raise ValueError("cross-review task_type cannot be removed or changed")
+        if task.status in {"review", "done"} and (body is not None and body != task.body or result is not None and result != task.result):
+            raise ValueError("reviewed evidence and criteria are immutable; request changes first")
+    if task.status != "done":
+        return task if kind in REVIEW_TYPES | {"review"} else None
     proposed = replace(task, body=body if body is not None else task.body)
     if applies(conn, proposed):
         reason = verify_evidence(proposed, result if result is not None else task.result)

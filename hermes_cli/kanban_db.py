@@ -2161,6 +2161,9 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_tree_budget import allowed
+    if not allowed(conn, task_id):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -2687,13 +2690,7 @@ def complete_task(
     :func:`request_review` applies. With no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
     ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
+    Created-card references are verified before completion.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2777,6 +2774,8 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+    from hermes_cli.kanban_cross_review import finish
+    finish(conn, task_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -3287,18 +3286,19 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
-    ``metadata["artifacts"]`` names the handoff's deliverable
-    files; a review handoff is the last implementer transition, and the
-    *reviewer's* completion is what cleans the managed scratch workspace up, so
-    the files are staged into the task's durable attachments dir here and the
-    staged paths ride the ``review_requested`` payload for the notifier to
-    upload. A declared artifact that cannot be preserved raises
-    :class:`ArtifactPreservationError`, rolling the whole transition back: the
-    task stays ``running`` and retryable, with no attachments and no event.
+    Review artifacts must be durable before handoff; preservation failure rolls back.
     """
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
+
+    from hermes_cli.kanban_evidence import fields
+    from hermes_cli.kanban_cross_review import REVIEW_TYPES
+    task = get_task(conn, task_id)
+    if task and fields(task.body).get("task_type") in REVIEW_TYPES:
+        complete_task(conn, task_id, result=summary or task.result, metadata=metadata,
+                      expected_run_id=expected_run_id, force=force)
+        return _ret(get_task(conn, task_id).status == "review", "independent cross-review required")
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)

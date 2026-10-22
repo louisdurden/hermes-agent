@@ -2345,6 +2345,11 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    if not dry_run:
+        from hermes_cli.kanban_tree_budget import enforce
+        from hermes_cli.kanban_cross_review import reconcile
+        result.auto_blocked.extend(enforce(conn))
+        reconcile(conn)
     if not dry_run and (board or _kb.get_current_board()) == "alfred-fleet":
         from hermes_cli.kanban_progress import observe_progress
         result.auto_blocked.extend(observe_progress(conn))
@@ -2359,11 +2364,9 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
-    # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
-    # skipped_unassigned — "busy, retry later" differs from "needs routing".
-    # Resolved BEFORE the review reservation so the reservation can see which
-    # review rows the lane loop would refuse this tick.
+    from hermes_cli.kanban_cross_review import managed_original
+    review_rows = [r for r in _lane_rows(conn, "review") if not managed_original(conn, r["id"])] if review_dispatch_enabled() else []
+    # Resolve the per-profile cap before reserving the review slot.
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -2380,10 +2383,7 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
-    # Review-lane reservation: the ready loop runs first and would otherwise
-    # consume the ENTIRE shared budget, starving reviews under a sustained ready
-    # backlog. When spawnable review work exists and there is any budget, hold
-    # one slot back.
+    # Reserve one slot so sustained ready work cannot starve reviews.
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,

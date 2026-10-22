@@ -41,8 +41,9 @@ def test_type_requires_correct_evidence(conn, tmp_path, monkeypatch, kind, resul
     monkeypatch.setattr(evidence, 'remote_commit', lambda value: value.get('commit_sha') == 'a'*40)
     tid = kb.create_task(conn, title=kind, body='task_type: '+kind)
     assert not kb.complete_task(conn, tid, result='{}')
-    assert kb.complete_task(conn, tid, result=json.dumps(result))
-    assert kb.get_task(conn, tid).status == 'done'
+    needs_review = kind in {'send_email', 'publish_post', 'listing'}
+    assert kb.complete_task(conn, tid, result=json.dumps(result)) is (not needs_review)
+    assert kb.get_task(conn, tid).status == ('review' if needs_review else 'done')
 
 
 def test_existing_artifact_is_checked_and_schema_invalid_rejected(conn, tmp_path):
