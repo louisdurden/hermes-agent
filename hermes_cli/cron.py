@@ -967,8 +967,14 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_daemon(args):
+    from cron.daemon import cron_daemon_command
+    return cron_daemon_command(args)
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
+    "daemon": lambda a: cron_daemon(a),
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),

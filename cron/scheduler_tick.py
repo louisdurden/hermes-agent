@@ -35,8 +35,10 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
 
     # Hold admission through the entire scan/advance/submit handoff. A predicate alone races
     # prepare after the check but before a due job enters the running-job ledger.
-    with retirement.work() as admitted:
-        if not admitted:
+    from cron.scheduler_service import tick_ownership
+
+    with tick_ownership() as owned, retirement.work() as admitted:
+        if not owned or not admitted:
             return 0
         return _tick_admitted(verbose, adapters, loop, sync, can_dispatch=can_dispatch)
 

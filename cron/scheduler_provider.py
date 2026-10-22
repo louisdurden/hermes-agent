@@ -394,6 +394,9 @@ def resolve_cron_scheduler() -> "CronScheduler":
     except Exception:
         pass
 
+    if name == "standalone":
+        return StandaloneCronScheduler()
+
     if not name or name in ("builtin", "in-process", "inprocess"):
         return InProcessCronScheduler()
 
@@ -672,3 +675,18 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+class StandaloneCronScheduler(InProcessCronScheduler):
+    """Local execution with ticking delegated to ``hermes cron daemon``.
+
+    Remains a built-in provider so gateway housekeeping never fires external-provider
+    misfire sweeps and multiplex mode never falls back to an embedded ticker.
+    """
+
+    @property
+    def name(self) -> str:
+        return "standalone"
+
+    def start(self, stop_event, **kwargs):
+        logger.info("Cron ticking delegated to the standalone scheduler")

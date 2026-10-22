@@ -171,6 +171,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[text | remove N | clear]", busy_policy="dispatch"),
     CommandDef("status", "Show session, model, token, and context info", "Session",
                busy_policy="dispatch"),
+    CommandDef("estado", "Estado operativo de la flota Alfred (solo propietario Telegram)", "Session",
+               gateway_only=True, busy_policy="dispatch"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",
                args_hint="[status]", subcommands=("status",), busy_policy="dispatch",
                busy_handler="egress", execute="egress"),

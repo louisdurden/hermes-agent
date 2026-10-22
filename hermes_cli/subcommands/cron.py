@@ -17,6 +17,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "cron", help="Cron job management", description="Manage scheduled tasks")
     cron_subparsers = cron_parser.add_subparsers(dest="cron_command")
 
+    daemon = cron_subparsers.add_parser("daemon", help="Run cron independently of the gateway")
+    daemon.add_argument("--interval", type=float, default=60, help="Tick interval in seconds")
+    _flag(daemon, "--single-profile", help="Serve only the launch profile")
+
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
     _flag(cron_list, "--all", help="Include disabled and completed jobs")
 

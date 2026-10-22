@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HERMES_HOME</key>
+		<string>__HOME__/.hermes</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>120</integer>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>ai.hermes.cron</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__RUNTIME__/.hermes/bin/hermes</string>
+		<string>cron</string>
+		<string>daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.hermes/logs/cron-daemon.error.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.hermes/logs/cron-daemon.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>__RUNTIME__</string>
+</dict>
+</plist>
