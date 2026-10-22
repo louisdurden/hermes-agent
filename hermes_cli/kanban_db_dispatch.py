@@ -2221,15 +2221,14 @@ def _tick_spawn_budget(
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
     """
-    # Count already-running tasks so max_spawn enforces concurrency, not a
-    # per-tick budget: "running" tasks stay running until the worker makes a terminal
-    # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
+    # The fleet contract caps live workers even when callers pass no config.
+    if (board or _kb.get_current_board()) == "alfred-fleet":
+        max_spawn = min(max_spawn, 3) if max_spawn is not None else 3
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
-    # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
             return False, None
@@ -2346,6 +2345,9 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    if not dry_run and (board or _kb.get_current_board()) == "alfred-fleet":
+        from hermes_cli.kanban_progress import observe_progress
+        result.auto_blocked.extend(observe_progress(conn))
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -2357,8 +2359,6 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".

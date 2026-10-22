@@ -107,7 +107,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "owner_conflict", "stalled"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -1212,6 +1212,9 @@ def create_task(
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    from hermes_cli.kanban_evidence import validate_task_body
+
+    validate_task_body(body)
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1345,6 +1348,9 @@ def create_task(
                             "dependency_wait",
                             {"reason": "parent_not_done", "parent": gating[0]},
                         )
+                from hermes_cli.kanban_evidence import enforce_resource_owner
+
+                enforce_resource_owner(conn, task_id)
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1499,6 +1505,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+        from hermes_cli.kanban_evidence import enforce_resource_owner
+
+        enforce_resource_owner(conn, task_id)
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
         _append_event(
@@ -2014,10 +2023,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'progress_stalled', 'owner_conflict') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if row and row["kind"] == "blocked":
+    if row and row["kind"] != "unblocked":
         return True
     trip = conn.execute(
         "SELECT payload FROM task_events "
@@ -2216,6 +2225,10 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        from hermes_cli.kanban_evidence import enforce_resource_owner
+
+        if not enforce_resource_owner(conn, task_id):
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2249,6 +2262,10 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
+            return None
+        from hermes_cli.kanban_evidence import enforce_resource_owner
+
+        if not enforce_resource_owner(conn, task_id):
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
@@ -2684,7 +2701,14 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    from hermes_cli.kanban_evidence import gate_completion, gate_empty_completion, applies
+
+    evidence_task = get_task(conn, task_id)
+    if evidence_task and applies(conn, evidence_task) and result is None:
+        result = evidence_task.result
+    if not gate_completion(conn, task_id, result, expected_run_id, force, metadata):
+        return False
+    gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2696,6 +2720,8 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if evidence_task and applies(conn, evidence_task) and get_task(conn, task_id) != evidence_task:
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -2786,44 +2812,6 @@ def _gate_created_cards(
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
-
-
-def _substantive_text(value: Optional[str]) -> bool:
-    return bool(value is not None and str(value).strip())
-
-
-def _gate_empty_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str],
-    summary: Optional[str],
-) -> None:
-    """Refuse a completion that would leave the card with no evidence.
-
-    Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
-    """
-    row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
-    if row["status"] == "review":
-        return
-    stored = row["result"]
-    if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
-        return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
-    raise EmptyCompletionError(task_id)
 
 
 def _stage_completion_artifacts(
@@ -3070,11 +3058,17 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_evidence import validate_task_body, enforce_resource_owner, prepare_edit
+
+    edit_snapshot = prepare_edit(conn, task_id, body, result)
+    validate_task_body(body)
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
     with write_txn(conn):
+        if edit_snapshot and get_task(conn, task_id) != edit_snapshot:
+            return False
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
@@ -3094,6 +3088,8 @@ def edit_task(
             f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
             (*params, task_id),
         )
+        if body is not None:
+            enforce_resource_owner(conn, task_id)
         if priority is not None:
             _append_event(conn, task_id, "reprioritized", {"priority": priority})
         if result is None:
@@ -3927,6 +3923,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    from hermes_cli.kanban_evidence import append_evidence_context
+
+    append_evidence_context(lines, conn, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
