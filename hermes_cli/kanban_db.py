@@ -1244,8 +1244,7 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # A concurrent idempotency race stabilises on the newest row at the next lookup.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -1255,10 +1254,12 @@ def create_task(
         if row:
             return row["id"]
 
+    from hermes_cli.kanban_spec import prepare, record
+
+    body, spec_comments = prepare(conn, body, creator_task_id)
     now = int(time.time())
 
-    # Only persistent kinds inherit the board ``default_workdir``: a scratch
-    # task inheriting it would point cleanup at the user's source tree.
+    # Only persistent kinds inherit default_workdir; scratch cleanup must not touch source.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
@@ -1268,12 +1269,10 @@ def create_task(
     for attempt in range(2):
         task_id = _new_task_id()
         try:
-            # allow_nested: graph builders compose create_task under one outer
-            # commit so the dispatcher never sees a half-built graph.
+            # Graph builders use one outer commit so dispatch never sees a partial graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
-                # Project worktree: fresh dir under the repo + deterministic
-                # branch, instead of the random ``wt/<id>`` worker fallback.
+                # Project worktrees use deterministic paths and branches.
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
@@ -1345,6 +1344,7 @@ def create_task(
                 from hermes_cli.kanban_evidence import enforce_resource_owner
 
                 enforce_resource_owner(conn, task_id)
+                record(conn, task_id, spec_comments, now)
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)

@@ -195,7 +195,9 @@ def _insert_decomposed_child(
     else:
         child_ws_path = None
     new_id = _new_task_id()
-    body = child.get("body")
+    from hermes_cli.kanban_spec import prepare, record
+
+    body, spec_comments = prepare(conn, child.get("body"), root_id)
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
@@ -210,5 +212,6 @@ def _insert_decomposed_child(
     _append_event(
         conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
     )
+    record(conn, new_id, spec_comments, now)
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

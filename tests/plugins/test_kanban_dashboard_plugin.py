@@ -463,7 +463,7 @@ def test_add_comment(client):
     assert r.status_code == 200
 
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
-    comments = r.json()["comments"]
+    comments = [c for c in r.json()["comments"] if c["author"] != "kanban-spec"]
     assert len(comments) == 1
     assert comments[0]["body"] == "how's progress?"
     assert comments[0]["author"] == "teknium"

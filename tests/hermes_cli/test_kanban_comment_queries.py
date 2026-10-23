@@ -40,7 +40,7 @@ def fresh_home(tmp_path, monkeypatch):
 def test_list_comments_after_cursor(fresh_home):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="chat")
+        tid = kb.create_task(conn, title="chat", body="Goal: test\nDone when: cursor works\nReceipt: assertions\nbudget_tokens: 100\nbudget_seconds: 60")
         c1 = kb.add_comment(conn, tid, author="alice", body="first")
         c2 = kb.add_comment(conn, tid, author="bob", body="second")
 

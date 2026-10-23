@@ -241,6 +241,28 @@ All dashboard API endpoints accept `?board=<slug>` for board scoping. The
 events WebSocket is pinned to a board at connection time; switching in
 the UI opens a fresh WS against the new board.
 
+### Mission and budgets at creation
+
+`kanban.require_spec` defaults to `warn`. Each task body must contain nonempty
+`Goal:`, `Done when:` and `Receipt:` sections (Spanish: `Objetivo:`,
+`Terminado cuando:`, `Recibo:`), plus effective positive `budget_tokens` and
+`budget_seconds` values, either declared in the body or supplied by
+`kanban.budget_defaults` (including task-type defaults).
+
+In `warn` mode, creation succeeds and a `kanban-spec` comment beginning
+`falta especificación:` lists missing parts. In `enforce` mode, creation is
+rejected without inserting the task. Children created through dispatcher tools
+or decomposition inherit missing sections from their creation parent and record
+a provenance comment; dependency links alone do not imply inheritance.
+
+```text
+Goal: Check the homepage links.
+Done when: Every link has a verified result and failures are listed.
+Receipt: A local report with each URL, result and verification date.
+budget_tokens: 100000
+budget_seconds: 600
+```
+
 ### Switching boards in the Desktop app
 
 In the Desktop app the board switcher sits in the header row at the top of

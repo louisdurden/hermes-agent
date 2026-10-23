@@ -1882,7 +1882,7 @@ DEFAULT_CONFIG = {
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
-    "kanban": {
+    "kanban": {"require_spec": "warn",
         "budget_defaults": {"budget_tokens": 400_000, "budget_seconds": 1800},
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
