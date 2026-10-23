@@ -121,11 +121,12 @@ def finish(conn, review_id):
             return
         if not allowed(conn, original.id):
             return
+        implementer = kb._validated_assignee(row['implementer']) if verdict == 'FAIL' else row['implementer']
         conn.execute('UPDATE kanban_cross_reviews SET verdict=?,proof=? WHERE review_id=?', (verdict, proof, review_id))
         kb._insert_comment(conn, original.id, row['reviewer'], verdict+': '+proof, int(time.time()))
         kb._append_event(conn, original.id, 'cross_review_verdict', {'review_id': review_id, 'verdict': verdict})
         if verdict == 'FAIL':
-            conn.execute("UPDATE tasks SET status='ready',assignee=? WHERE id=?", (row['implementer'], original.id))
+            conn.execute("UPDATE tasks SET status='ready',assignee=? WHERE id=?", (implementer, original.id))
     if verdict == 'PASS':
         kb.complete_task(conn, original.id, result=original.result)
     elif verdict == 'NO_VERIFICADO':

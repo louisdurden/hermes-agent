@@ -48,6 +48,10 @@ def fresh_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in ("dev", "x"):
+        profile = home / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "SOUL.md").write_text("Board isolation test worker")
     for var in (
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -349,6 +353,9 @@ class TestCLI:
 
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
+        profile = tmp_path / "profiles" / "dev"
+        profile.mkdir(parents=True)
+        (profile / "SOUL.md").write_text("Board isolation test worker")
         env = {"HERMES_HOME": str(tmp_path)}
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
         assert _cli(["boards", "create", "projB"], env_extra=env).returncode == 0

@@ -100,7 +100,7 @@ def decompose_triage_task(
     in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
     """
     from hermes_cli.kanban_db import (
-        _canonical_assignee, _link, _append_event, _insert_comment,
+        _validated_assignee as _canonical_assignee, _link, _append_event, _insert_comment,
         write_txn, recompute_ready,
     )
 
@@ -181,7 +181,7 @@ def _insert_decomposed_child(
     ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _validated_assignee as _canonical_assignee, _append_event,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
