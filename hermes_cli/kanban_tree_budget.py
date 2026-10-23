@@ -184,13 +184,18 @@ def enforce(conn, *, now=None, signal_fn=None):
             if not exceeded:
                 continue
             conn.execute('UPDATE kanban_tree_budgets SET exceeded=1 WHERE root_id=?', (root,))
+            root_was_ready = conn.execute('SELECT status FROM tasks WHERE id=?', (root,)).fetchone()[0] == 'ready'
             for task_id in used['task_ids']:
                 row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
                 if row['status'] not in {'done', 'archived'}:
+                    block_exceeded_ready(conn, task_id, cap=cap, used=used, now=now)
                     conn.execute("UPDATE tasks SET status='blocked', block_kind='budget_exceeded', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?", (task_id,))
                     kb._end_run(conn, task_id, outcome='budget_exceeded', status='blocked', summary='budget_exceeded')
             if not cap['exceeded']:
-                kb._insert_comment(conn, root, 'alfred', 'budget_exceeded: '+json.dumps(used), now)
+                if not root_was_ready:
+                    message = (f"budget_exceeded: usado {used['tokens']} de {cap['budget_tokens']} tokens; "
+                               f"{used['seconds']} de {cap['budget_seconds']} segundos")
+                    kb._insert_comment(conn, root, 'alfred', message, now)
                 kb._append_event(conn, root, 'budget_exceeded', used)
                 blocked.append(root)
         # Signal only fingerprint-verified, host-local workers, retaining run identity
@@ -202,6 +207,49 @@ def enforce(conn, *, now=None, signal_fn=None):
     return blocked
 
 
+def block_exceeded_ready(conn, task_id, *, cap=None, used=None, now=None):
+    """Park rejected ready claims once, including descendants of a sticky root."""
+    from hermes_cli import kanban_db as kb
+    cap = cap or limits(conn, root_for(conn, task_id))
+    used = used or consumption(conn, root_for(conn, task_id))
+    if not (cap['exceeded'] or used['tokens'] > cap['budget_tokens'] or used['seconds'] > cap['budget_seconds']):
+        return False
+    changed = conn.execute("UPDATE tasks SET status='blocked', block_kind='budget_exceeded', "
+                           "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                           "WHERE id=? AND status='ready'", (task_id,)).rowcount
+    if changed:
+        message = (f"budget_exceeded: usado {used['tokens']} de {cap['budget_tokens']} tokens; "
+                   f"{used['seconds']} de {cap['budget_seconds']} segundos")
+        kb._insert_comment(conn, task_id, 'alfred', message, int(time.time()) if now is None else now)
+        kb._append_event(conn, task_id, 'budget_exceeded', {'reason': message})
+    return bool(changed)
+
+
+def update_limits_from_body(conn, task_id, body):
+    """Shared CLI/tool edit boundary; historical consumption never resets."""
+    from hermes_cli.kanban_evidence import fields
+    values = fields(body)
+    keys = [key for key in ('budget_tokens', 'budget_seconds') if key in values]
+    if not keys:
+        return
+    root = root_for(conn, task_id)
+    if root != task_id:
+        raise ValueError('El presupuesto pertenece a la raíz ' + root)
+    cap = limits(conn, root)
+    used = consumption(conn, root)
+    updates = {key: int(values[key]) for key in keys}
+    for key, value in updates.items():
+        spent = used['tokens' if key == 'budget_tokens' else 'seconds']
+        if value < spent:
+            raise ValueError(f'{key}: nuevo tope {value} menor que el gasto actual {spent}')
+    conn.execute('UPDATE kanban_tree_budgets SET budget_tokens=?, budget_seconds=? WHERE root_id=?',
+                 (updates.get('budget_tokens', cap['budget_tokens']),
+                  updates.get('budget_seconds', cap['budget_seconds']), root))
+    fresh = limits(conn, root)
+    if used['tokens'] <= fresh['budget_tokens'] and used['seconds'] <= fresh['budget_seconds']:
+        conn.execute('UPDATE kanban_tree_budgets SET exceeded=0, warned=0 WHERE root_id=?', (root,))
+
+
 def allowed(conn, task_id):
     """Sticky root guard for manual claims and completion between ticks."""
     from hermes_cli import kanban_db as kb
@@ -210,7 +258,10 @@ def allowed(conn, task_id):
     with accounting_txn(conn):
         cap = limits(conn, root_for(conn, task_id))
         used = consumption(conn, root_for(conn, task_id))
-        return not cap['exceeded'] and used['tokens'] <= cap['budget_tokens'] and used['seconds'] <= cap['budget_seconds']
+        ok = not cap['exceeded'] and used['tokens'] <= cap['budget_tokens'] and used['seconds'] <= cap['budget_seconds']
+        if not ok:
+            block_exceeded_ready(conn, task_id, cap=cap, used=used)
+        return ok
 
 
 def record_response(agent, tokens, *, missing=False):

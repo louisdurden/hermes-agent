@@ -3053,19 +3053,19 @@ def edit_task(
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
     from hermes_cli.kanban_evidence import validate_task_body, enforce_resource_owner, prepare_edit
-
     edit_snapshot = prepare_edit(conn, task_id, body, result)
     validate_task_body(body)
-    changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
-        if value is not None
-    ]
+    changed_fields = [field for field, value in (
+        ("title", title), ("body", body), ("priority", priority)) if value is not None]
     with write_txn(conn):
         if edit_snapshot and get_task(conn, task_id) != edit_snapshot:
             return False
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
+        if body is not None:
+            from hermes_cli.kanban_tree_budget import update_limits_from_body
+            update_limits_from_body(conn, task_id, body)
         assignments = []
         params = []
         for field, value in (("title", title), ("body", body), ("priority", priority)):

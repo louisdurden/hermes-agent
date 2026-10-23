@@ -217,6 +217,22 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
+    def health_causes(self, results):
+        from gateway.kanban_dispatch_health import task_causes
+        causes = []
+        by_board = dict(results or [])
+        for slug in self._board_slugs():
+            try:
+                with self.kb.pin_first_board_resolution():
+                    conn = _kbc().connect(board=slug)
+                try:
+                    causes.extend(task_causes(conn, slug, by_board.get(slug)))
+                finally:
+                    conn.close()
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                causes.append(f'{slug}: diagnóstico no disponible')
+        return causes
+
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
