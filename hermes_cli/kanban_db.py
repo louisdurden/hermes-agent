@@ -2769,6 +2769,12 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        from hermes_cli.kanban_mission_notebook import stage_completion
+
+        stage_completion(conn, get_task(conn, task_id))
+    from hermes_cli.kanban_mission_notebook import flush_pending
+
+    flush_pending(conn, limit=1, task_id=task_id)
     from hermes_cli.kanban_cross_review import finish
     finish(conn, task_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -3913,22 +3919,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
     (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
-    task = get_task(conn, task_id)
-    if not task:
-        raise ValueError(f"unknown task {task_id}")
-    # One clock reading so every relative age in this rendering agrees.
-    now = int(time.time())
-    lines: list[str] = []
-    _ctx_header(lines, task)
-    from hermes_cli.kanban_evidence import append_evidence_context
+    from hermes_cli.kanban_mission_notebook import build_context
 
-    append_evidence_context(lines, conn, task)
-    _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_parent_results(lines, conn, task_id, now)
-    _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    return build_context(conn, task_id)
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
