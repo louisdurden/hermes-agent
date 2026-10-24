@@ -31,7 +31,7 @@ def task(board, body=""):
     return kb.create_task(board, title="fixture", assignee="default", body=body)
 
 
-def test_start_injects_real_page_and_refuses_unread_page(board, monkeypatch):
+def test_start_injects_real_page_and_degrades_when_unread(board, monkeypatch):
     tid = task(board)
     seen = []
     def exchange(*args, **kwargs):
@@ -44,8 +44,10 @@ def test_start_injects_real_page_and_refuses_unread_page(board, monkeypatch):
     def offline(*args, **kwargs):
         raise RuntimeError("offline")
     monkeypatch.setattr(notebook, "exchange", offline)
-    with pytest.raises(RuntimeError):
-        kb.build_worker_context(board, tid)
+    # gbrain caído no frena al worker: arranca con un aviso en el contexto.
+    context = kb.build_worker_context(board, tid)
+    assert "No disponible al iniciar" in context
+    assert "Plan compartido real" not in context
 
 
 def test_explicit_mission_and_invalid_slug(board):
