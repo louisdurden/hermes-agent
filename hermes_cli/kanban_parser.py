@@ -275,6 +275,7 @@ _SPECS = [
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
+        _arg("--assignee", help="Only claim if the owner still matches this name"),
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [

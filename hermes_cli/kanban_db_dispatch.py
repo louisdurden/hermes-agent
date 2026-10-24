@@ -25,6 +25,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_assignees import is_manual_assignee
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -768,7 +769,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.assignee, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -776,6 +777,8 @@ def detect_stale_running(
     ).fetchall()
 
     for row in rows:
+        if is_manual_assignee(row["assignee"]):
+            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - int(row["active_started_at"])
@@ -1770,6 +1773,9 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     if not rows:
         return False
     profile_exists = _profile_exists_fn()
+    rows = [row for row in rows if not is_manual_assignee(row["assignee"])]
+    if not rows:
+        return False
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
@@ -2042,12 +2048,9 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
+    # Manual owners pull via claim_task; a matching profile must never launch them.
     profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
+    if is_manual_assignee(assignee) or (profile_exists is not None and not profile_exists(assignee)):
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
@@ -2096,7 +2099,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expected_assignee=assignee)
     if claimed is None:
         return False
     try:
@@ -2297,7 +2300,7 @@ def _any_spawnable_review(
         assignee = row["assignee"]
         if not assignee:
             continue
-        if profile_exists is not None and not profile_exists(assignee):
+        if is_manual_assignee(assignee) or (profile_exists is not None and not profile_exists(assignee)):
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
@@ -2307,16 +2310,11 @@ def _any_spawnable_review(
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
-    """``kanban.default_assignee`` when it names a real profile this home may
-    claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
-    gate). Otherwise ``None`` so an unassigned shared-board card is never
-    written to. When the profiles module isn't importable trust the
-    operator's config: the downstream check still buckets a missing profile
-    as nonspawnable."""
+    """Resolve an automatic default owner using the spawn gate; exclude manual owners."""
     name = (default_assignee or "").strip() or None
     if name:
         profile_exists = _profile_exists_fn()
-        if profile_exists is not None and not profile_exists(name):
+        if is_manual_assignee(name) or (profile_exists is not None and not profile_exists(name)):
             return None
     return name
 

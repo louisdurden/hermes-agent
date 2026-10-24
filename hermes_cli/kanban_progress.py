@@ -17,6 +17,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hermes_cli.kanban_assignees import is_manual_assignee
+
 FLEET_BOARD = "alfred-fleet"
 PROGRESS_HEARTBEAT_SECONDS = 300
 _SUPERVISOR = "alfred-progress-watchdog"
@@ -239,6 +241,8 @@ def observe_progress(conn: sqlite3.Connection, *, now: int | None = None) -> lis
     heartbeat = _heartbeat_seconds()
     stalled = []
     for task in conn.execute("SELECT * FROM tasks WHERE status = 'running'").fetchall():
+        if is_manual_assignee(task["assignee"]):
+            continue  # Interactive clients have no Hermes worker progress to observe.
         previous = conn.execute("SELECT * FROM fleet_progress_snapshots WHERE task_id = ?", (task["id"],)).fetchone()
         dead = _worker_dead(task)
         if not dead and previous and now - previous["observed_at"] < heartbeat:

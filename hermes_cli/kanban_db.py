@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_assignees import (
-    canonical_assignee as _canonical_assignee, validated_assignee as _validated_assignee,
+    known_assignees, canonical_assignee as _canonical_assignee, validated_assignee as _validated_assignee,
 )
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
@@ -2201,7 +2201,7 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2212,6 +2212,10 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if expected_assignee is not None:
+            owner = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if owner is None or owner["assignee"] != _canonical_assignee(expected_assignee):
+                return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2240,7 +2244,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2249,6 +2253,10 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if expected_assignee is not None:
+            owner = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if owner is None or owner["assignee"] != _canonical_assignee(expected_assignee):
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4301,15 +4309,6 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
-    """``{"name", "on_disk", "counts"}`` for every on-disk profile or task
-    assignee, so a fresh profile appears in pickers before it has a task."""
-    on_disk = set(list_profiles_on_disk())
-    counts = _counts_by_assignee(conn)
-    return [
-        {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
-        for name in sorted(on_disk | set(counts))
-    ]
 
 
 # --- Runs (attempt history on a task) ---

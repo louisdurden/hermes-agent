@@ -10,6 +10,8 @@ import subprocess
 import sys
 import uuid
 
+from hermes_cli.kanban_assignees import is_manual_assignee
+
 PROFILES = (
     "fleetauthority", "fleetcontent", "fleetestetica", "fleetfabric",
     "fleetliterature", "fleetoutreach", "fleetpremium", "fleetseo", "forma-supervisor",
@@ -45,9 +47,10 @@ def mission_for(conn, task):
         return None
     from hermes_cli.kanban_evidence import fields
 
+    owner = "default" if is_manual_assignee(task.assignee) else task.assignee
     slug = (fields(task.body).get("mission_page") or
             data.get("tasks", {}).get(task.id) or
-            data["profiles"].get(task.assignee or "default"))
+            data["profiles"].get(owner or "default"))
     if not isinstance(slug, str) or not SLUG.fullmatch(slug):
         raise ValueError("mission_page_required")
     return slug
@@ -55,6 +58,7 @@ def mission_for(conn, task):
 
 def exchange(root, profile, operation, **data):
     """A bounded child keeps anyio scopes out of the gateway's event loop."""
+    profile = "default" if is_manual_assignee(profile) else profile
     payload = dict(root=str(root), profile=profile or "default", operation=operation, **data)
     child = subprocess.run(
         [sys.executable, str(Path(__file__).resolve())], input=json.dumps(payload),
